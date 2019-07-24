@@ -21,71 +21,12 @@
 #include <vector>
 
 #include "olap/aggregate_func.h"
+#include "olap/field.h"
 #include "olap/tablet_schema.h"
 #include "olap/types.h"
 #include "runtime/descriptors.h"
 
 namespace doris {
-
-class ColumnSchema {
-public:
-    ColumnSchema(const FieldAggregationMethod& agg, const FieldType& type) {
-        _type_info = get_type_info(type);
-        _agg_info = get_aggregate_info(agg, type);
-        _size = _type_info->size();
-        _col_offset = 0;
-    }
-
-    bool is_null(const char* row) const {
-        bool is_null = *reinterpret_cast<const bool*>(row + _col_offset);
-        return is_null;
-    }
-
-    void set_null(char* row) const {
-        *reinterpret_cast<bool*>(row + _col_offset) = true;
-    }
-
-    void set_not_null(char* row) const {
-        *reinterpret_cast<bool*>(row + _col_offset) = false;
-    }
-
-    void set_col_offset(int offset) {
-        _col_offset = offset;
-    }
-
-    int get_col_offset() const {
-        return _col_offset;
-    }
-
-    int compare(const char* left, const char* right) const {
-        bool l_null = *reinterpret_cast<const bool*>(left + _col_offset);
-        bool r_null = *reinterpret_cast<const bool*>(right + _col_offset);
-        if (l_null != r_null) {
-            return l_null ? -1 : 1;
-        } else {
-            return l_null ? 0 : (_type_info->cmp(left + _col_offset + 1, right + _col_offset + 1));
-        }
-    }
-
-    void aggregate(char* left, const char* right, Arena* arena) const {
-        _agg_info->update(left + _col_offset, right + _col_offset, arena);
-    }
-
-    void finalize(char* data) const {
-        // data of Hyperloglog type will call this function.
-        _agg_info->finalize(data + _col_offset + 1, nullptr);
-    }
-
-    int size() const {
-        return _size;
-    }
-private:
-    FieldType _type;
-    TypeInfo* _type_info;
-    const AggregateInfo* _agg_info;
-    int _size;
-    int _col_offset;
-};
 
 class Schema {
 public:
@@ -94,22 +35,20 @@ public:
         _num_key_columns = 0;
         for (int i = 0; i < schema.num_columns(); ++i) {
             const TabletColumn& column = schema.column(i);
-            ColumnSchema col_schema(column.aggregation(), column.type());
-            col_schema.set_col_offset(offset);
-            offset += col_schema.size() + 1; // 1 for null byte
+            Field* filed = FieldFactory::create(column);
+            filed->set_offset(offset);
+            offset += filed->size() + 1; // 1 for null byte
             if (column.is_key()) {
                 _num_key_columns++;
             }
-            if (column.type() == OLAP_FIELD_TYPE_HLL) {
-                _hll_col_ids.push_back(i);
-            }
-            _cols.push_back(col_schema);
+            _cols.push_back(filed);
         }
     }
 
     int compare(const char* left , const char* right) const {
         for (size_t i = 0; i < _num_key_columns; ++i) {
-            int comp = _cols[i].compare(left, right);
+            size_t offset = _cols[i]->get_offset();
+            int comp = _cols[i]->cmp((char*)left + offset, (char*)right + offset);
             if (comp != 0) {
                 return comp;
             }
@@ -117,48 +56,53 @@ public:
         return 0;
     }
 
+    void ingest_raw_value(int index, char* dest, void* src, Arena* arena) {
+        _cols[index]->consume(dest, src, arena);
+    }
+
     void aggregate(const char* left, const char* right, Arena* arena) const {
         for (size_t i = _num_key_columns; i < _cols.size(); ++i) {
-            _cols[i].aggregate(const_cast<char*>(left), right, arena);
+            size_t offset = _cols[i]->get_offset();
+            _cols[i]->aggregate((char*)left + offset, (char*)right + offset, arena);
         }
     }
 
-    void finalize(const char* data) const {
-        for (int col_id : _hll_col_ids) {
-            _cols[col_id].finalize(const_cast<char*>(data));
+    void finalize(const char* data, Arena* arena) const {
+        for (size_t i = _num_key_columns; i < _cols.size(); ++i) {
+            size_t offset = _cols[i]->get_offset();
+            _cols[i]->finalize((char*)data + offset , arena);
         }
     }
 
     int get_col_offset(int index) const {
-        return _cols[index].get_col_offset();
+        return _cols[index]->get_offset();
     }
     size_t get_col_size(int index) const {
-        return _cols[index].size();
+        return _cols[index]->size();
     }
 
     bool is_null(int index, const char* row) const {
-        return _cols[index].is_null(row);
+        return _cols[index]->is_null((char*)row);
     }
 
     void set_null(int index, char*row) {
-        _cols[index].set_null(row);
+        _cols[index]->set_null(row);
     }
 
     void set_not_null(int index, char*row) {
-        _cols[index].set_not_null(row);
+        _cols[index]->set_not_null(row);
     }
 
     size_t schema_size() {
         size_t size = _cols.size();
         for (auto col : _cols) {
-            size += col.size();
+            size += col->size();
         }
         return size;
     }
 private:
-    std::vector<ColumnSchema> _cols;
+    std::vector<Field*> _cols;
     size_t _num_key_columns;
-    std::vector<int> _hll_col_ids;
 };
 
 } // namespace doris

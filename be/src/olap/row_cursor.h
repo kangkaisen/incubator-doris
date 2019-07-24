@@ -50,7 +50,7 @@ public:
         for (auto cid : cids) {
             char* dest = lhs->get_field_ptr(cid);
             char* src = rhs->get_field_ptr(cid);
-            lhs->_field_array[cid]->aggregate(dest, src);
+            lhs->_field_array[cid]->aggregate(dest, src, nullptr);
         }
     }
 
@@ -189,7 +189,8 @@ private:
     char* _variable_buf = nullptr;
     size_t _variable_len;
     bool _variable_buf_allocated_by_pool;
-    std::vector<HllContext*> hll_contexts;
+
+    Arena _arena;
 
     DISALLOW_COPY_AND_ASSIGN(RowCursor);
 };
@@ -222,7 +223,7 @@ inline OLAPStatus RowCursor::agg_init(const RowCursor& other) {
         Field* field = _field_array[cid];
         char* dest = get_field_ptr(cid);
         char* src = other.get_field_ptr(cid);
-        field->agg_init(dest, src);
+        field->init(dest, src, &_arena);
     }
 
     return OLAP_SUCCESS;
@@ -230,8 +231,8 @@ inline OLAPStatus RowCursor::agg_init(const RowCursor& other) {
 
 inline void RowCursor::finalize_one_merge(const std::vector<uint32_t>& ids) {
     for (uint32_t id : ids) {
-        char* dest = _field_array[id]->get_ptr(_fixed_buf);
-        _field_array[id]->finalize(dest);
+        char* dest = _field_array[id]->get_field_ptr(_fixed_buf);
+        _field_array[id]->finalize(dest, &_arena);
     }
 }
 

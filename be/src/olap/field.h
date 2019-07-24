@@ -37,13 +37,8 @@ namespace doris {
 // 出于效率的考虑，大部分函数实现均没有对参数进行检查
 class Field {
 public:
-    // 使用FieldInfo创建一个Field对象的实例
-    // 根据类型的不同，使用不同的类模板参数或者子类
-    // 对于没有预料到的类型，会返回NULL
-    static Field* create(const TabletColumn& column);
-    static Field* create_by_type(const FieldType& type);
-
-    Field(const TabletColumn& column);
+    explicit Field(const TabletColumn& column);
+    virtual ~Field() = default;
 
     inline void set_offset(size_t offset) { _offset = offset; }
     inline size_t get_offset() const { return _offset; }
@@ -79,13 +74,34 @@ public:
     inline int index_cmp(char* left, char* right) const;
     inline bool equal(char* left, char* right);
 
-    inline void aggregate(char* dest, char* src);
-    inline void finalize(char* data);
+    virtual void consume(char* dst, void* src, Arena* arena) {
+        _agg_info->consume(dst, src, arena);
+    }
+
+    // for key field, raw value field and simple agg field, only copy memory
+    // for complex agg field, construct the agg state from binary data
+    virtual void init(char* dst, const char* src, Arena* arena) {
+        copy_without_pool(dst, src);
+    }
+
+    inline void aggregate(char* dst, char* src, Arena* arena) {
+        _agg_info->update(dst, src, arena);
+    }
+
+    inline void finalize(char* data, Arena* arena) {
+        _agg_info->finalize(data, arena);
+    }
+
+    virtual void allocate_memory(Slice* slice, char* variable_ptr, Arena* arena) {
+    }
+
+    virtual size_t get_variable_len() {
+        return 0;
+    }
 
     inline void copy_with_pool(char* dest, const char* src, MemPool* mem_pool);
     inline void copy_without_pool(char* dest, const char* src);
     inline void copy_without_pool(char* dest, bool is_null, const char* src);
-    inline void agg_init(char* dest, const char* src);
 
     // copy filed content from src to dest without nullbyte
     inline void copy_content(char* dest, const char* src, MemPool* mem_pool) {
@@ -106,6 +122,10 @@ public:
     }
 
     inline uint32_t hash_code(char* data, uint32_t seed) const;
+protected:
+    // 长度，单位为字节
+    // 除字符串外，其它类型都是确定的
+    uint32_t _length;
 private:
     FieldType _type;
     // Field的长度，单位为字节
@@ -197,17 +217,6 @@ inline bool Field::equal(char* left, char* right) {
     }
 }
 
-inline void Field::aggregate(char* dest, char* src) {
-    _agg_info->update(dest, src, nullptr);
-}
-
-inline void Field::finalize(char* data) {
-    if (OLAP_UNLIKELY(_type == OLAP_FIELD_TYPE_HLL)) {
-        // hyperloglog type use this function
-        _agg_info->finalize(data, nullptr);
-    }
-}
-
 inline void Field::copy_with_pool(char* dest, const char* src, MemPool* mem_pool) {
     bool is_null = *reinterpret_cast<const bool*>(src);
     *reinterpret_cast<bool*>(dest) = is_null;
@@ -232,23 +241,6 @@ inline void Field::copy_without_pool(char* dest, bool is_null, const char* src) 
         return;
     }
     return _type_info->copy_without_pool(dest + 1, src);
-}
-
-inline void Field::agg_init(char* dest, const char* src) {
-    // TODO(zc): This function is also used to initialize key columns.
-    // So, refactor this in later PR
-    if (OLAP_LIKELY(_type != OLAP_FIELD_TYPE_HLL)) {
-        copy_without_pool(dest, src);
-    } else {
-        bool is_null = *reinterpret_cast<const bool*>(src);
-        *reinterpret_cast<bool*>(dest) = is_null;
-        Slice* slice = reinterpret_cast<Slice*>(dest + 1);
-        size_t hll_ptr = *(size_t*)(slice->data - sizeof(HllContext*));
-        HllContext* context = (reinterpret_cast<HllContext*>(hll_ptr));
-        HllSetHelper::init_context(context);
-        HllSetHelper::fill_set(src + 1, context);
-        context->has_value = true;
-    }
 }
 
 inline void Field::to_index(char* dest, const char* src) {
@@ -283,6 +275,125 @@ inline uint32_t Field::hash_code(char* data, uint32_t seed) const {
     }
     return _type_info->hash_code(data + 1, seed);
 }
+
+class CharField: public Field {
+public:
+    explicit CharField(const TabletColumn& column):Field(column) {
+    }
+
+    //the char field is especial, which need the _length info when consume raw data
+    void consume(char* dest, void* value, Arena* arena) override {
+        const StringValue* src = reinterpret_cast<StringValue*>(value);
+        auto* dest_slice = (Slice*)(dest);
+        dest_slice->size = _length;
+        dest_slice->data = arena->Allocate(dest_slice->size);
+        memcpy(dest_slice->data, src->ptr, src->len);
+        memset(dest_slice->data + src->len, 0, dest_slice->size - src->len);
+    }
+
+    size_t get_variable_len() override {
+        return  _length;
+    }
+
+    void allocate_memory(Slice* slice, char* variable_ptr, Arena* arena) override {
+        slice->data = variable_ptr;
+        slice->size = _length;
+        variable_ptr += slice->size;
+    }
+};
+class VarcharField: public Field {
+public:
+    explicit VarcharField(const TabletColumn& column): Field(column) {
+    }
+
+    size_t get_variable_len() override {
+        return  _length - OLAP_STRING_MAX_BYTES;
+    }
+
+    void allocate_memory(Slice* slice, char* variable_ptr, Arena* arena) override {
+        slice->data = variable_ptr;
+        slice->size = _length - OLAP_STRING_MAX_BYTES;
+        variable_ptr += slice->size;
+    }
+};
+class BitmapAggField: public Field {
+public:
+    explicit BitmapAggField(const TabletColumn& column):Field(column) {
+    }
+
+    void init(char *dest, const char *src, Arena *arena) override {
+        bool src_null = *reinterpret_cast<const bool *>(src);
+        *reinterpret_cast<bool *>(dest) = src_null;
+        auto *dst_slice = reinterpret_cast<Slice *>(dest + 1);
+        char *mem = arena->Allocate(sizeof(RoaringBitmap));
+        dst_slice->data = mem;
+        dst_slice->size = sizeof(RoaringBitmap);
+        auto *dst_bitmap = new(mem) RoaringBitmap();
+        if (src_null) {
+            return;
+        }
+        const auto *src_slice = reinterpret_cast<const Slice *>(src + 1);
+        auto src_bitmap = RoaringBitmap(src_slice->data);
+        dst_bitmap->merge(src_bitmap);
+    }
+
+    size_t get_variable_len() override {
+        return sizeof(RoaringBitmap);
+    }
+};
+
+class HllAggField: public Field {
+public:
+    explicit HllAggField(const TabletColumn& column):Field(column) {
+    }
+
+    void init(char *dest, const char *src, Arena *arena) override {
+        bool is_null = *reinterpret_cast<const bool *>(src);
+        *reinterpret_cast<bool *>(dest) = is_null;
+        char* mem = arena->Allocate(sizeof(HllContext));
+        auto* context = new (mem) HllContext;
+        HllSetHelper::init_context(context);
+        HllSetHelper::fill_set(src + 1, context);
+        char* variable_ptr = arena->Allocate(sizeof(HllContext*) + HLL_COLUMN_DEFAULT_LEN);
+        *(size_t*)(variable_ptr) = (size_t)(context);
+        variable_ptr += sizeof(HllContext*);
+        auto *dest_slice = reinterpret_cast<Slice *>(dest + 1);
+        dest_slice->data = variable_ptr;
+        dest_slice->size = HLL_COLUMN_DEFAULT_LEN;
+    }
+
+    size_t get_variable_len() override {
+        return HLL_COLUMN_DEFAULT_LEN + sizeof(HllContext*);;
+    }
+};
+
+class FieldFactory {
+public:
+    static Field* create(const TabletColumn& column) {
+        switch (column.aggregation()) {
+            case OLAP_FIELD_AGGREGATION_NONE:
+            case OLAP_FIELD_AGGREGATION_SUM:
+            case OLAP_FIELD_AGGREGATION_MIN:
+            case OLAP_FIELD_AGGREGATION_MAX:
+            case OLAP_FIELD_AGGREGATION_REPLACE:
+                switch (column.type()) {
+                    case OLAP_FIELD_TYPE_CHAR:
+                        return new CharField(column);
+                    case OLAP_FIELD_TYPE_VARCHAR:
+                        return new VarcharField(column);
+                    default:
+                        return new Field(column);
+                }
+            case OLAP_FIELD_AGGREGATION_HLL_UNION:
+                return new HllAggField(column);
+            case OLAP_FIELD_AGGREGATION_BITMAP_COUNT:
+                return new BitmapAggField(column);
+            case OLAP_FIELD_AGGREGATION_UNKNOWN:
+                return nullptr;
+        }
+        return nullptr;
+    }
+};
 
 }  // namespace doris
 

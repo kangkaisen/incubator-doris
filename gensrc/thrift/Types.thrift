@@ -129,6 +129,7 @@ enum TAggregationType {
     MIN,
     REPLACE,
     HLL_UNION,
+    BITMAP_COUNT,
     NONE
 }
 

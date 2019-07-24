@@ -34,6 +34,7 @@ public enum AggregateType {
     MAX("MAX"),
     REPLACE("REPLACE"),
     HLL_UNION("HLL_UNION"),
+    BITMAP_COUNT("BITMAP_COUNT"),
     NONE("NONE");
 
     private static EnumMap<AggregateType, EnumSet<PrimitiveType>> compatibilityMap;
@@ -87,6 +88,10 @@ public enum AggregateType {
         primitiveTypeList.clear();
         primitiveTypeList.add(PrimitiveType.HLL);
         compatibilityMap.put(HLL_UNION, EnumSet.copyOf(primitiveTypeList));
+
+        primitiveTypeList.clear();
+        primitiveTypeList.add(PrimitiveType.VARCHAR);
+        compatibilityMap.put(BITMAP_COUNT, EnumSet.copyOf(primitiveTypeList));
     
         compatibilityMap.put(NONE, EnumSet.allOf(PrimitiveType.class));
     }
@@ -127,6 +132,8 @@ public enum AggregateType {
                 return TAggregationType.NONE;
             case HLL_UNION:
                 return TAggregationType.HLL_UNION;
+            case BITMAP_COUNT:
+                return TAggregationType.BITMAP_COUNT;
             default:
                 return null;
         }

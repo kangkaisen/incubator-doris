@@ -17,6 +17,7 @@
 
 #include "olap/memtable.h"
 
+#include "common/bitmap.h"
 #include "olap/hll.h"
 #include "olap/rowset/column_data_writer.h"
 #include "olap/row_cursor.h"
@@ -67,79 +68,8 @@ void MemTable::insert(Tuple* tuple) {
             continue;
         }
         offset += 1;
-        TypeDescriptor type = slot->type();
-        switch (type.type) {
-            case TYPE_CHAR: {
-                const StringValue* src = tuple->get_string_slot(slot->tuple_offset());
-                Slice* dest = (Slice*)(_tuple_buf + offset);
-                dest->size = _tablet_schema->column(i).length();
-                dest->data = _arena.Allocate(dest->size);
-                memcpy(dest->data, src->ptr, src->len);
-                memset(dest->data + src->len, 0, dest->size - src->len);
-                break;
-            }
-            case TYPE_VARCHAR: {
-                const StringValue* src = tuple->get_string_slot(slot->tuple_offset());
-                Slice* dest = (Slice*)(_tuple_buf + offset);
-                dest->size = src->len;
-                dest->data = _arena.Allocate(dest->size);
-                memcpy(dest->data, src->ptr, dest->size);
-                break;
-            }
-            case TYPE_HLL: {
-                const StringValue* src = tuple->get_string_slot(slot->tuple_offset());
-                Slice* dest = (Slice*)(_tuple_buf + offset);
-                dest->size = src->len;
-                bool exist = _skip_list->Contains(_tuple_buf);
-                if (exist) {
-                    dest->data = _arena.Allocate(dest->size);
-                    memcpy(dest->data, src->ptr, dest->size);
-                } else {
-                    dest->data = src->ptr;
-                    char* mem = _arena.Allocate(sizeof(HllContext));
-                    HllContext* context = new (mem) HllContext;
-                    HllSetHelper::init_context(context);
-                    HllSetHelper::fill_set(reinterpret_cast<char*>(dest), context);
-                    context->has_value = true;
-                    char* variable_ptr = _arena.Allocate(sizeof(HllContext*) + HLL_COLUMN_DEFAULT_LEN);
-                    *(size_t*)(variable_ptr) = (size_t)(context);
-                    variable_ptr += sizeof(HllContext*);
-                    dest->data = variable_ptr;
-                    dest->size = HLL_COLUMN_DEFAULT_LEN;
-                }
-                break;
-            }
-            case TYPE_DECIMAL: {
-                DecimalValue* decimal_value = tuple->get_decimal_slot(slot->tuple_offset());
-                decimal12_t* storage_decimal_value = reinterpret_cast<decimal12_t*>(_tuple_buf + offset);
-                storage_decimal_value->integer = decimal_value->int_value();
-                storage_decimal_value->fraction = decimal_value->frac_value();
-                break;
-            }
-            case TYPE_DECIMALV2: {
-                DecimalV2Value* decimal_value = tuple->get_decimalv2_slot(slot->tuple_offset());
-                decimal12_t* storage_decimal_value = reinterpret_cast<decimal12_t*>(_tuple_buf + offset);
-                storage_decimal_value->integer = decimal_value->int_value();
-                storage_decimal_value->fraction = decimal_value->frac_value();
-                break;
-            }
-            case TYPE_DATETIME: {
-                DateTimeValue* datetime_value = tuple->get_datetime_slot(slot->tuple_offset());
-                uint64_t* storage_datetime_value = reinterpret_cast<uint64_t*>(_tuple_buf + offset);
-                *storage_datetime_value = datetime_value->to_olap_datetime();
-                break;
-            }
-            case TYPE_DATE: {
-                DateTimeValue* date_value = tuple->get_datetime_slot(slot->tuple_offset());
-                uint24_t* storage_date_value = reinterpret_cast<uint24_t*>(_tuple_buf + offset);
-                *storage_date_value = static_cast<int64_t>(date_value->to_olap_date());
-                break;
-            }
-            default: {
-                memcpy(_tuple_buf + offset, tuple->get_slot(slot->tuple_offset()), _schema->get_col_size(i));
-                break;
-            }
-        }
+        void* value = tuple->get_slot(slot->tuple_offset());
+        _schema->ingest_raw_value(i, _tuple_buf + offset, value, &_arena);
         offset = offset + _schema->get_col_size(i);
     }
 
@@ -157,7 +87,7 @@ OLAPStatus MemTable::flush(RowsetWriterSharedPtr rowset_writer) {
         Table::Iterator it(_skip_list);
         for (it.SeekToFirst(); it.Valid(); it.Next()) {
             const char* row = it.key();
-            _schema->finalize(row);
+            _schema->finalize(row, &_arena);
             RETURN_NOT_OK(rowset_writer->add_row(row, _schema));
         }
         RETURN_NOT_OK(rowset_writer->flush());

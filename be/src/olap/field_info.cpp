@@ -95,6 +95,8 @@ FieldAggregationMethod FieldInfo::get_aggregation_type_by_string(const string& s
         aggregation_type = OLAP_FIELD_AGGREGATION_REPLACE;
     } else if (0 == upper_str.compare("HLL_UNION")) {
         aggregation_type = OLAP_FIELD_AGGREGATION_HLL_UNION;
+    } else if (0 == upper_str.compare("BITMAP_COUNT")) {
+        aggregation_type = OLAP_FIELD_AGGREGATION_BITMAP_COUNT;
     } else {
         LOG(WARNING) << "invalid aggregation type string. [aggregation='" << str << "']";
         aggregation_type = OLAP_FIELD_AGGREGATION_UNKNOWN;
@@ -192,6 +194,9 @@ string FieldInfo::get_string_by_aggregation_type(FieldAggregationMethod type) {
 
         case OLAP_FIELD_AGGREGATION_HLL_UNION:
             return "HLL_UNION";
+
+        case OLAP_FIELD_AGGREGATION_BITMAP_COUNT:
+            return "BITMAP_COUNT";
 
         default:
             return "UNKNOWN";

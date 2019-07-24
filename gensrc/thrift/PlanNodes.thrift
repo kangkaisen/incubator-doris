@@ -321,6 +321,7 @@ enum TAggregationOp {
   ROW_NUMBER,
   LAG,
   HLL_C, 
+  BITMAP_COUNT,
 }
 
 //struct TAggregateFunctionCall {

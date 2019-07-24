@@ -24,6 +24,7 @@ add_library(Common STATIC
   resource_tls.cpp
   logconfig.cpp
   configbase.cpp
+  bitmap.h
 )
 
 #ADD_BE_TEST(resource_tls_test)
