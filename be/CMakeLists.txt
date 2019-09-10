@@ -57,7 +57,12 @@ else()
 endif()
 set(LLVM_BIN "${LLVM_HOME}/bin")
 
-option(MAKE_TEST "ON for make unit test or OFF for not" OFF)
+if (APPLE)
+    set(MAKE_TEST "ON")
+else()
+    option(MAKE_TEST "ON for make unit test or OFF for not" OFF)
+endif()
+message(STATUS "make test: ${MAKE_TEST}")
 option(WITH_MYSQL "Support access MySQL" ON)
 
 # Check gcc
@@ -65,7 +70,7 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS "4.8.2")
         message(FATAL_ERROR "Need GCC version at least 4.8.2")
     endif()
-else()
+elseif (NOT APPLE)
     message(FATAL_ERROR "Compiler should be GNU")
 endif()
 
@@ -92,7 +97,7 @@ endif()
 message(STATUS "build gensrc if necessary")
 execute_process(COMMAND make -C ${BASE_DIR}/../gensrc/
                 RESULT_VARIABLE MAKE_GENSRC_RESULT)
-if(NOT ${MAKE_GENSRC_RESULT} EQUAL 0)
+if(NOT ${MAKE_GENSRC_RESULT} EQUAL 0 AND NOT APPLE)
     message(FATAL_ERROR "Failed to build ${BASE_DIR}/../gensrc/")
 endif()
 
@@ -101,7 +106,7 @@ set(Boost_DEBUG FALSE)
 set(Boost_USE_MULTITHREADED ON)
 set(BOOST_ROOT ${THIRDPARTY_DIR})
 
-find_package(Boost 1.55.0 REQUIRED COMPONENTS thread regex filesystem system date_time program_options)
+find_package(Boost 1.55.0 COMPONENTS thread regex filesystem system date_time program_options)
 include_directories(${Boost_INCLUDE_DIRS})
 message(STATUS ${Boost_LIBRARIES})
 
@@ -231,9 +236,9 @@ find_program(LLVM_CONFIG_EXECUTABLE llvm-config
   NO_DEFAULT_PATH
 )
 
-if (NOT LLVM_CONFIG_EXECUTABLE)
+if (NOT LLVM_CONFIG_EXECUTABLE AND NOT APPLE)
   message(FATAL_ERROR "Could not find llvm-config")
-endif (NOT LLVM_CONFIG_EXECUTABLE)
+endif (NOT LLVM_CONFIG_EXECUTABLE AND NOT APPLE)
 
 # clang++
 find_program(LLVM_CLANG_EXECUTABLE clang++
@@ -242,9 +247,9 @@ find_program(LLVM_CLANG_EXECUTABLE clang++
   NO_DEFAULT_PATH
 )
 
-if (NOT LLVM_CLANG_EXECUTABLE)
+if (NOT LLVM_CLANG_EXECUTABLE AND NOT APPLE)
   message(FATAL_ERROR "Could not find clang++")
-endif (NOT LLVM_CLANG_EXECUTABLE)
+endif (NOT LLVM_CLANG_EXECUTABLE AND NOT APPLE)
 
 # opt
 find_program(LLVM_OPT_EXECUTABLE opt
@@ -253,9 +258,9 @@ find_program(LLVM_OPT_EXECUTABLE opt
   NO_DEFAULT_PATH
 )
 
-if (NOT LLVM_OPT_EXECUTABLE)
+if (NOT LLVM_OPT_EXECUTABLE AND NOT APPLE)
   message(FATAL_ERROR "Could not find llvm opt")
-endif (NOT LLVM_OPT_EXECUTABLE)
+endif (NOT LLVM_OPT_EXECUTABLE AND NOT APPLE)
 
 message(STATUS "LLVM llvm-config found at: ${LLVM_CONFIG_EXECUTABLE}")
 message(STATUS "LLVM clang++ found at: ${LLVM_CLANG_EXECUTABLE}")
@@ -420,11 +425,13 @@ message(STATUS "CLANG_IR_CXX_FLAGS: ${CLANG_IR_CXX_FLAGS}")
 
 # CMake really doesn't like adding link directories and wants absolute paths
 # Reconstruct it with LLVM_MODULE_LIBS and LLVM_LIBRARY_DIR
-string(REPLACE " " ";" LLVM_LIBS_LIST ${LLVM_MODULE_LIBS})
-set (LLVM_MODULE_LIBS "")
-foreach (LIB ${LLVM_LIBS_LIST})
-  set(LLVM_MODULE_LIBS ${LLVM_MODULE_LIBS} "${LLVM_LIBRARY_DIR}/${LIB}")
-endforeach(LIB)
+if (NOT APPLE)
+    string(REPLACE " " ";" LLVM_LIBS_LIST ${LLVM_MODULE_LIBS})
+    set (LLVM_MODULE_LIBS "")
+    foreach (LIB ${LLVM_LIBS_LIST})
+    set(LLVM_MODULE_LIBS ${LLVM_MODULE_LIBS} "${LLVM_LIBRARY_DIR}/${LIB}")
+    endforeach(LIB)
+endif()
 
 message(STATUS "LLVM include dir: ${LLVM_INCLUDE_DIR}")
 message(STATUS "LLVM lib dir: ${LLVM_LIBRARY_DIR}")
