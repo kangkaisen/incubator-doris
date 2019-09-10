@@ -81,6 +81,8 @@ set(UTIL_FILES
   frontend_helper.cpp
   faststring.cc
   slice.cpp
+  bpacking.cpp
+  for_coding.cpp
 )
 
 if (WITH_MYSQL)
