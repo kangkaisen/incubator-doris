@@ -73,12 +73,12 @@ public:
 
     // Set the bit specified by param, note that uint64_t type contains 2^6 bits
     void set(uint32_t index) {
-        _data[index >> 6] |= 1L << (index % 64);
+        _data[index >> 6] |= 1L << (index & 63);
     }
 
     // Return true if the bit specified by param is set
     bool get(uint32_t index) const {
-        return (_data[index >> 6] & (1L << (index % 64))) != 0;
+        return (_data[index >> 6] & (1L << (index & 63))) != 0;
     }
 
     // Merge with another BitSet by byte, return false when the length is not equal
