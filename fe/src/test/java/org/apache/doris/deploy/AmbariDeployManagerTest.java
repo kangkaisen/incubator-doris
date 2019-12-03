@@ -27,6 +27,7 @@ import org.junit.Test;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.util.Base64;
 
 public class AmbariDeployManagerTest {
 
@@ -44,7 +45,7 @@ public class AmbariDeployManagerTest {
 
         Field encodedAuthInfoF = manager.getClass().getDeclaredField("encodedAuthInfo");
         encodedAuthInfoF.setAccessible(true);
-        encodedAuthInfoF.set(manager, new sun.misc.BASE64Encoder().encode("admin:admin".getBytes()));
+        encodedAuthInfoF.set(manager, Base64.getEncoder().encode("admin:admin".getBytes()));
 
         Field ambariUrlF = manager.getClass().getDeclaredField("ambariUrl");
         ambariUrlF.setAccessible(true);

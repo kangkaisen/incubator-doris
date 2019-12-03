@@ -17,6 +17,12 @@
 
 package org.apache.doris.rpc;
 
+import com.baidu.bjf.remoting.protobuf.utils.JDKCompilerHelper;
+import com.baidu.bjf.remoting.protobuf.utils.compiler.JdkCompiler;
+import com.baidu.jprotobuf.pbrpc.client.ProtobufRpcProxy;
+import com.baidu.jprotobuf.pbrpc.transport.RpcClient;
+import com.baidu.jprotobuf.pbrpc.transport.RpcClientOptions;
+import com.google.common.collect.Maps;
 import org.apache.doris.common.Config;
 import org.apache.doris.proto.PCancelPlanFragmentRequest;
 import org.apache.doris.proto.PCancelPlanFragmentResult;
@@ -30,12 +36,6 @@ import org.apache.doris.proto.PUniqueId;
 import org.apache.doris.thrift.TExecPlanFragmentParams;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TUniqueId;
-
-import com.baidu.jprotobuf.pbrpc.client.ProtobufRpcProxy;
-import com.baidu.jprotobuf.pbrpc.transport.RpcClient;
-import com.baidu.jprotobuf.pbrpc.transport.RpcClientOptions;
-import com.google.common.collect.Maps;
-
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.thrift.TException;
@@ -52,6 +52,10 @@ public class BackendServiceProxy {
     private Map<TNetworkAddress, PBackendService> serviceMap;
 
     private static BackendServiceProxy INSTANCE;
+
+    static {
+        JDKCompilerHelper.setCompiler(new JdkCompiler(JdkCompiler.class.getClassLoader(), "1.9"));
+    }
 
     public BackendServiceProxy() {
         final RpcClientOptions rpcOptions = new RpcClientOptions();
