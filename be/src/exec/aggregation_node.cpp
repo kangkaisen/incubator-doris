@@ -29,6 +29,7 @@
 #include "exprs/slot_ref.h"
 #include "gen_cpp/Exprs_types.h"
 #include "gen_cpp/PlanNodes_types.h"
+#include "olap/row_block2.h"
 #include "runtime/descriptors.h"
 #include "runtime/mem_pool.h"
 #include "runtime/raw_value.h"
@@ -135,7 +136,7 @@ Status AggregationNode::prepare(RuntimeState* state) {
 
     // TODO: how many buckets?
     _hash_tbl.reset(new HashTable(
-            _build_expr_ctxs, _probe_expr_ctxs, 1, true, 
+            _build_expr_ctxs, _probe_expr_ctxs, 1, true,
             vector<bool>(_build_expr_ctxs.size(), false), id(), mem_tracker(), 1024));
 
     if (_probe_expr_ctxs.empty()) {
@@ -154,67 +155,63 @@ Status AggregationNode::open(RuntimeState* state) {
     RETURN_IF_ERROR(Expr::open(_probe_expr_ctxs, state));
     RETURN_IF_ERROR(Expr::open(_build_expr_ctxs, state));
 
-    for (int i = 0; i < _aggregate_evaluators.size(); ++i) {
-        RETURN_IF_ERROR(_aggregate_evaluators[i]->open(state, _agg_fn_ctxs[i]));
-    }
+    // for (int i = 0; i < _aggregate_evaluators.size(); ++i) {
+    //     RETURN_IF_ERROR(_aggregate_evaluators[i]->open(state, _agg_fn_ctxs[i]));
+    // }
 
     RETURN_IF_ERROR(_children[0]->open(state));
 
-    RowBatch batch(_children[0]->row_desc(), state->batch_size(), mem_tracker());
     int64_t num_input_rows = 0;
     int64_t num_agg_rows = 0;
 
-    bool early_return = false;
-    bool limit_with_no_agg = (limit() != -1 && (_aggregate_evaluators.size() == 0));
+    // bool early_return = false;
+    // bool limit_with_no_agg = (limit() != -1 && (_aggregate_evaluators.size() == 0));
     DCHECK_EQ(_aggregate_evaluators.size(), _agg_fn_ctxs.size());
 
+    RowBatch batch(_children[0]->row_desc(), state->batch_size(), mem_tracker());
+    RowBlockV2* block = nullptr;
+    bool is_merge = _aggregate_evaluators[0]->is_merge();
     while (true) {
         bool eos = false;
         RETURN_IF_CANCELLED(state);
         RETURN_IF_ERROR(state->check_query_state("Aggregation, before getting next from child 0."));
-        RETURN_IF_ERROR(_children[0]->get_next(state, &batch, &eos));
-        // SCOPED_TIMER(_build_timer);
-        if (VLOG_ROW_IS_ON) {
-            for (int i = 0; i < batch.num_rows(); ++i) {
-                TupleRow* row = batch.get_row(i);
-                VLOG_ROW << "id=" << id() << " input row: "
-                        << row->to_string(_children[0]->row_desc());
-            }
-        }
-
-        int64_t agg_rows_before = _hash_tbl->size();
-
-        if (_process_row_batch_fn != NULL) {
-            _process_row_batch_fn(this, &batch);
-        } else if (_singleton_output_tuple != NULL) {
-            SCOPED_TIMER(_build_timer);
-            process_row_batch_no_grouping(&batch, _tuple_pool.get());
-        } else {
-            process_row_batch_with_grouping(&batch, _tuple_pool.get());
-            if (limit_with_no_agg) {
-                if (_hash_tbl->size() >= limit()) {
-                    early_return = true;
+        if (_singleton_output_tuple != NULL) {
+            if (is_merge) {
+                RETURN_IF_ERROR(_children[0]->get_next(state, &batch, &eos));
+                SCOPED_TIMER(_build_timer);
+                for (int i = 0; i < _aggregate_evaluators.size(); ++i) {
+                    SlotDescriptor* intermediate_slot_desc = _intermediate_tuple_desc->slots()[i];
+                    int64_t* count = reinterpret_cast<int64_t*>(_singleton_output_tuple->get_slot(intermediate_slot_desc->tuple_offset()));
+                    // fixme(kks): only for count and sum
+                    for (int i = 0; i < batch.num_rows(); ++i) {
+                        *count += *(reinterpret_cast<int64_t*>(batch.get_row(i)->get_tuple(0)->get_slot(intermediate_slot_desc->tuple_offset())));
+                    }
+                }
+            } else {
+                RETURN_IF_ERROR(_children[0]->get_next(state, &block, &eos));
+                if (UNLIKELY(eos)) {
+                    break;
+                }
+                SCOPED_TIMER(_build_timer);
+                for (int i = 0; i < _aggregate_evaluators.size(); ++i) {
+                    SlotDescriptor* intermediate_slot_desc = _intermediate_tuple_desc->slots()[i];
+                    int64_t* count = reinterpret_cast<int64_t*>(_singleton_output_tuple->get_slot(intermediate_slot_desc->tuple_offset()));
+                    if (_aggregate_evaluators[i]->is_count()) {
+                        *count += block->selected_size();
+                    } else if (_aggregate_evaluators[i]->is_sum()){
+                        ColumnBlock column_block = block->column_block(_aggregate_evaluators[i]->column_name());
+                        for(int i = 0; i < block->selected_size(); i++) {
+                            uint16_t row_idx = block->selection_vector()[i];
+                            *count += *(reinterpret_cast<const int32_t*> (column_block.cell_ptr(row_idx)));
+                        }
+                    }
                 }
             }
+        } else {
+            LOG(WARNING) << " _singleton_output_tuple is not null ";
         }
-
-        // RETURN_IF_LIMIT_EXCEEDED(state);
-        RETURN_IF_ERROR(state->check_query_state("Aggregation, after hashing the child 0."));
-
-        COUNTER_SET(_hash_table_buckets_counter, _hash_tbl->num_buckets());
-        COUNTER_SET(memory_used_counter(),
-                    _tuple_pool->peak_allocated_bytes() + _hash_tbl->byte_size());
-        COUNTER_SET(_hash_table_load_factor_counter, _hash_tbl->load_factor());
-        num_agg_rows += (_hash_tbl->size() - agg_rows_before);
-        num_input_rows += batch.num_rows();
-
         batch.reset();
-
-        RETURN_IF_ERROR(state->check_query_state("Aggregation, after setting the counter."));
         if (eos) {
-            break;
-        }
-        if (early_return) {
             break;
         }
     }
@@ -257,10 +254,8 @@ Status AggregationNode::get_next(RuntimeState* state, RowBatch* row_batch, bool*
         int row_idx = row_batch->add_row();
         TupleRow* row = row_batch->get_row(row_idx);
         Tuple* intermediate_tuple = _output_iterator.get_row()->get_tuple(0);
-        Tuple* output_tuple =
-            finalize_tuple(intermediate_tuple, row_batch->tuple_data_pool());
+        Tuple* output_tuple = finalize_tuple(intermediate_tuple, row_batch->tuple_data_pool());
         row->set_tuple(0, output_tuple);
-
         if (ExecNode::eval_conjuncts(ctxs, num_ctxs, row)) {
             VLOG_ROW << "output row: " << row->to_string(row_desc());
             row_batch->commit_last_row();

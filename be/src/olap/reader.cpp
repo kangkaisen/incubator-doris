@@ -20,6 +20,7 @@
 #include "olap/rowset/column_data.h"
 #include "olap/tablet.h"
 #include "olap/row_block.h"
+#include "olap/row_block2.h"
 #include "olap/row_cursor.h"
 #include "util/date_func.h"
 #include "util/mem_util.hpp"
@@ -71,6 +72,12 @@ public:
         }
     }
 
+    OLAPStatus next_block(RowBlockV2** block, bool* delete_flag) {
+        DCHECK(_cur_child != nullptr);
+        // auto res = _rs_reader->next_block(&block);
+        return _normal_next(block, delete_flag);
+    }
+
     // Clear the MergeSet element and reset state.
     void clear();
 
@@ -83,12 +90,13 @@ private:
                   _reader(reader) { }
 
         OLAPStatus init() {
-            auto res = _row_cursor.init(_reader->_tablet->tablet_schema(), _reader->_seek_columns);
-            if (res != OLAP_SUCCESS) {
-                LOG(WARNING) << "failed to init row cursor, res=" << res;
-                return res;
-            }
-            RETURN_NOT_OK(_refresh_current_row());
+            // auto res = _row_cursor.init(_reader->_tablet->tablet_schema(), _reader->_seek_columns);
+            // if (res != OLAP_SUCCESS) {
+            //     LOG(WARNING) << "failed to init row cursor, res=" << res;
+            //     return res;
+            // }
+            // RETURN_NOT_OK(_refresh_current_row());
+            // RETURN_NOT_OK(_refresh_current_block());
             return OLAP_SUCCESS;
         }
 
@@ -113,6 +121,7 @@ private:
             return res;
         }
 
+        RowsetReaderSharedPtr _rs_reader;
     private:
         // refresh_current_row
         OLAPStatus _refresh_current_row() {
@@ -140,7 +149,6 @@ private:
             return OLAP_ERR_DATA_EOF;
         }
 
-        RowsetReaderSharedPtr _rs_reader;
         const RowCursor* _current_row = nullptr;
         bool _is_delete = false;
         Reader* _reader;
@@ -158,6 +166,8 @@ private:
 
     inline OLAPStatus _merge_next(const RowCursor** row, bool* delete_flag);
     inline OLAPStatus _normal_next(const RowCursor** row, bool* delete_flag);
+
+    inline OLAPStatus _normal_next(RowBlockV2** row, bool* delete_flag);
 
     // each ChildCtx corresponds to a rowset reader
     std::vector<ChildCtx*> _children;
@@ -202,10 +212,10 @@ OLAPStatus CollectIterator::init(Reader* reader) {
 
 OLAPStatus CollectIterator::add_child(RowsetReaderSharedPtr rs_reader) {
     std::unique_ptr<ChildCtx> child(new ChildCtx(rs_reader, _reader));
-    RETURN_NOT_OK(child->init());
-    if (child->current_row() == nullptr) {
-        return OLAP_SUCCESS;
-    }
+    // RETURN_NOT_OK(child->init());
+    // if (child->current_block() == nullptr) {
+    //     return OLAP_SUCCESS;
+    // }
 
     ChildCtx* child_ptr = child.release();
     _children.push_back(child_ptr);
@@ -260,6 +270,22 @@ inline OLAPStatus CollectIterator::_normal_next(const RowCursor** row, bool* del
         LOG(WARNING) << "failed to get next from child, res=" << res;
         return res;
     }
+}
+
+inline OLAPStatus CollectIterator::_normal_next(RowBlockV2** block, bool* delete_flag) {
+    auto res = OLAP_SUCCESS;
+    for(;_child_idx < _children.size(); _child_idx++, _cur_child = _children[_child_idx]) {
+        res = _cur_child->_rs_reader->next_block(block);
+        if (LIKELY(res == OLAP_SUCCESS)) {
+            return OLAP_SUCCESS;
+        } else if (res == OLAP_ERR_DATA_EOF) {
+            continue;
+        } else {
+            LOG(WARNING) << "failed to get next from child, res=" << res;
+            return res;
+        }
+    }
+    return res;
 }
 
 bool CollectIterator::ChildCtxComparator::operator()(const ChildCtx* a, const ChildCtx* b) {
@@ -344,6 +370,21 @@ OLAPStatus Reader::init(const ReaderParams& read_params) {
 
     return OLAP_SUCCESS;
 }
+
+
+OLAPStatus Reader::next_block(RowBlockV2** block, MemPool* mem_pool, ObjectPool* agg_pool, bool* eof) {
+    auto res = _collect_iter->next_block(block, &_next_delete_flag);
+    if (res != OLAP_SUCCESS) {
+        if (res != OLAP_ERR_DATA_EOF) {
+            return res;
+        } else {
+            *eof = true;
+            return OLAP_SUCCESS;
+        }
+    }
+    return OLAP_SUCCESS;
+}
+
 
 OLAPStatus Reader::_dup_key_next_row(RowCursor* row_cursor, MemPool* mem_pool, ObjectPool* agg_pool, bool* eof) {
     if (UNLIKELY(_next_key == nullptr)) {
@@ -561,7 +602,8 @@ OLAPStatus Reader::_capture_rs_readers(const ReaderParams& read_params) {
         }
     }
 
-    _next_key = _collect_iter->current_row(&_next_delete_flag);
+    //_next_key = _collect_iter->current_row(&_next_delete_flag);
+    //_next_block = _collect_iter->current_block();
     return OLAP_SUCCESS;
 }
 
@@ -580,17 +622,17 @@ OLAPStatus Reader::_init_params(const ReaderParams& read_params) {
         return res;
     }
 
-    res = _init_load_bf_columns(read_params);
-    if (res != OLAP_SUCCESS) {
-        OLAP_LOG_WARNING("fail to init load bloom filter columns. [res=%d]", res);
-        return res;
-    }
+    // res = _init_load_bf_columns(read_params);
+    // if (res != OLAP_SUCCESS) {
+    //     OLAP_LOG_WARNING("fail to init load bloom filter columns. [res=%d]", res);
+    //     return res;
+    // }
 
-    res = _init_delete_condition(read_params);
-    if (res != OLAP_SUCCESS) {
-        OLAP_LOG_WARNING("fail to init delete param. [res=%d]", res);
-        return res;
-    }
+    // res = _init_delete_condition(read_params);
+    // if (res != OLAP_SUCCESS) {
+    //     OLAP_LOG_WARNING("fail to init delete param. [res=%d]", res);
+    //     return res;
+    // }
 
     res = _init_return_columns(read_params);
     if (res != OLAP_SUCCESS) {

@@ -35,6 +35,7 @@ Schema& Schema::operator=(const Schema& other) {
 void Schema::_copy_from(const Schema& other) {
     _col_ids = other._col_ids;
     _col_offsets = other._col_offsets;
+    _name_to_id = other._name_to_id;
 
     _num_key_columns = other._num_key_columns;
     _schema_size = other._schema_size;
@@ -62,6 +63,7 @@ void Schema::_init(const std::vector<TabletColumn>& cols,
         if (col_id_set.find(cid) == col_id_set.end()) {
             continue;
         }
+        _name_to_id.emplace(cols[cid].name(), cid);
         _cols[cid] = FieldFactory::create(cols[cid]);
 
         _col_offsets[cid] = offset;

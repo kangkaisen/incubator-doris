@@ -33,11 +33,16 @@ public:
 
     ~BetaRowsetReader() override {
         _rowset->release();
+        for(auto block: _blocks) {
+            delete block;
+        }
     }
 
     OLAPStatus init(RowsetReaderContext* read_context) override;
 
     OLAPStatus next_block(RowBlock** block) override;
+
+    OLAPStatus next_block(RowBlockV2** block) override;
 
     bool delete_flag() override { return _rowset->delete_flag(); }
 
@@ -63,6 +68,12 @@ private:
     std::unique_ptr<RowBlockV2> _input_block;
     std::unique_ptr<RowBlock> _output_block;
     std::unique_ptr<RowCursor> _row;
+
+    int64_t _row_count = 0;
+
+    std::unique_ptr<Schema> _schema;
+    // fixme(kks)
+    std::vector<RowBlockV2*> _blocks;
 };
 
 } // namespace doris

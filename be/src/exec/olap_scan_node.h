@@ -47,6 +47,8 @@ enum TransferStatus {
     ERROR = 7
 };
 
+class RowBlockV2;
+
 class OlapScanNode : public ScanNode {
 public:
     OlapScanNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
@@ -55,6 +57,7 @@ public:
     virtual Status prepare(RuntimeState* state);
     virtual Status open(RuntimeState* state);
     virtual Status get_next(RuntimeState* state, RowBatch* row_batch, bool* eos);
+    virtual Status get_next(RuntimeState* state, RowBlockV2** row_batch, bool* eos);
     Status collect_query_statistics(QueryStatistics* statistics) override;
     virtual Status close(RuntimeState* state);
     virtual Status set_scan_ranges(const std::vector<TScanRangeParams>& scan_ranges);
@@ -149,9 +152,9 @@ protected:
     Status normalize_binary_predicate(SlotDescriptor* slot, ColumnValueRange<T>* range);
 
     void transfer_thread(RuntimeState* state);
-    void scanner_thread(OlapScanner* scanner);
+    void scanner_thread();
 
-    Status add_one_batch(RowBatchInterface* row_batch);
+    Status add_one_batch(RowBlockV2* row_batch);
 
     // Write debug string of this into out.
     virtual void debug_string(int indentation_level, std::stringstream* out) const;
@@ -176,6 +179,9 @@ private:
     std::vector<SlotDescriptor*> _string_slots;
 
     bool _eos;
+
+    OlapScanner* _cur_scanner = nullptr;
+    size_t _scanner_index = 0;
 
     // column -> ColumnValueRange map
     std::map<std::string, ColumnValueRangeType> _column_value_ranges;
@@ -209,15 +215,15 @@ private:
     boost::condition_variable _row_batch_added_cv;
     boost::condition_variable _row_batch_consumed_cv;
 
-    std::list<RowBatchInterface*> _materialized_row_batches;
+    std::list<RowBlockV2*> _materialized_row_batches;
 
     boost::mutex _scan_batches_lock;
     boost::condition_variable _scan_batch_added_cv;
     int32_t _scanner_task_finish_count;
 
-    std::list<RowBatchInterface*> _scan_row_batches;
+    std::list<RowBlockV2*> _scan_row_batches;
 
-    std::list<OlapScanner*> _olap_scanners;
+    std::vector<OlapScanner*> _olap_scanners;
 
     int _max_materialized_row_batches;
     bool _start;

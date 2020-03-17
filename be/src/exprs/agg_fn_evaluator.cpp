@@ -85,6 +85,7 @@ Status AggFnEvaluator::create(
         const TExpr& desc,
         bool is_analytic_fn,
         AggFnEvaluator** result) {
+    LOG(WARNING) << "column_name " << desc.nodes[0].column_name;
     *result = pool->add(new AggFnEvaluator(desc.nodes[0], is_analytic_fn));
     int node_idx = 0;
     for (int i = 0; i < desc.nodes[0].num_children; ++i) {
@@ -101,6 +102,7 @@ Status AggFnEvaluator::create(
 AggFnEvaluator::AggFnEvaluator(const TExprNode& desc, bool is_analytic_fn) :
         _fn(desc.fn),
         _is_merge(desc.agg_expr.is_merge_agg),
+        _column_name(desc.column_name),
         _is_analytic_fn(is_analytic_fn),
         _return_type(TypeDescriptor::from_thrift(desc.fn.ret_type)),
         _intermediate_type(TypeDescriptor::from_thrift(desc.fn.aggregate_fn.intermediate_type)),
@@ -346,7 +348,7 @@ inline void AggFnEvaluator::set_any_val(
         return;
 
     case TYPE_DECIMALV2:
-        reinterpret_cast<DecimalV2Val*>(dst)->val 
+        reinterpret_cast<DecimalV2Val*>(dst)->val
             = reinterpret_cast<const PackedInt128*>(slot)->value;
         return;
 
@@ -368,7 +370,6 @@ inline void AggFnEvaluator::set_output_slot(const AnyVal* src,
 
     dst->set_not_null(dst_slot_desc->null_indicator_offset());
     void* slot = dst->get_slot(dst_slot_desc->tuple_offset());
-
     switch (dst_slot_desc->type().type) {
     case TYPE_NULL:
         return;
@@ -421,7 +422,7 @@ inline void AggFnEvaluator::set_output_slot(const AnyVal* src,
         return;
 
     case TYPE_DECIMALV2:
-        *reinterpret_cast<PackedInt128*>(slot) = 
+        *reinterpret_cast<PackedInt128*>(slot) =
             reinterpret_cast<const DecimalV2Val*>(src)->val;
         return;
 
@@ -941,7 +942,7 @@ void AggFnEvaluator::serialize_or_finalize(FunctionContext* agg_fn_ctx, Tuple* s
     }
 
     case TYPE_CHAR:
-    case TYPE_VARCHAR: 
+    case TYPE_VARCHAR:
     case TYPE_HLL:
     case TYPE_OBJECT: {
         typedef StringVal(*Fn)(FunctionContext*, AnyVal*);

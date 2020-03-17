@@ -46,6 +46,7 @@ class OlapScanNode;
 class OLAPReader;
 class RuntimeProfile;
 class Field;
+class RowBlockV2;
 
 class OlapScanner {
 public:
@@ -61,7 +62,7 @@ public:
 
     Status open();
 
-    Status get_batch(RuntimeState* state, RowBatch* batch, bool* eof);
+    Status get_batch(RuntimeState* state, RowBlockV2** batch, bool* eof);
 
     Status close(RuntimeState* state);
 
@@ -126,6 +127,7 @@ private:
     std::vector<uint32_t> _return_columns;
 
     RowCursor _read_row_cursor;
+    std::unique_ptr<RowBlockV2> _block;
 
     std::vector<SlotDescriptor*> _query_slots;
 

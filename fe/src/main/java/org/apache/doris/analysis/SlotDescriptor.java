@@ -147,6 +147,11 @@ public class SlotDescriptor {
         this.originType = column.getOriginType();
     }
 
+    // don't change the slot type!
+    public void setOnlyColumn(Column column) {
+        this.column = column;
+    }
+
     public boolean isMaterialized() {
         return isMaterialized;
     }

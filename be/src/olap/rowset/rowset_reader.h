@@ -27,6 +27,7 @@
 namespace doris {
 
 class RowBlock;
+class RowBlockV2;
 class RowsetReader;
 using RowsetReaderSharedPtr = std::shared_ptr<RowsetReader>;
 
@@ -43,6 +44,8 @@ public:
     //      OLAP_ERR_DATA_EOF and set *block to null when there is no more block.
     //      Others when error happens.
     virtual OLAPStatus next_block(RowBlock** block) = 0;
+
+    virtual OLAPStatus next_block(RowBlockV2** block) = 0;
 
     virtual bool delete_flag() = 0;
 

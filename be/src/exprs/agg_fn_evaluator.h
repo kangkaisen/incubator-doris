@@ -94,7 +94,7 @@ public:
 
     const TypeDescriptor& intermediate_type() const {
         return _intermediate_slot_desc->type();
-    } 
+    }
 
     //PrimitiveType type() const { return _type.type; }
     AggregationOp agg_op() const {
@@ -108,6 +108,15 @@ public:
     }
     bool is_count_star() const {
         return _agg_op == AggregationOp::COUNT && _input_exprs_ctxs.empty();
+    }
+    inline bool is_count() const {
+        return _agg_op == AggregationOp::COUNT;
+    }
+    inline bool is_sum() const {
+        return _agg_op == AggregationOp::SUM;
+    }
+    inline std::string column_name() const {
+        return _column_name;
     }
     bool is_builtin() const {
         return _function_type == TFunctionBinaryType::BUILTIN;
@@ -206,6 +215,8 @@ private:
 
     /// Indicates whether to Update() or Merge()
     const bool _is_merge;
+    // todo(kks): support multi solt
+    const std::string _column_name;
     /// Indicates which functions must be loaded.
     const bool _is_analytic_fn;
     boost::scoped_ptr<HybirdMap> _hybird_map;

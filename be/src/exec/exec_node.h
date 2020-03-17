@@ -40,6 +40,7 @@ class ExprContext;
 class ObjectPool;
 class Counters;
 class RowBatch;
+class RowBlockV2;
 class RuntimeState;
 class TPlan;
 class TupleRow;
@@ -97,6 +98,8 @@ public:
     // Caller must not be holding any io buffers. This will cause deadlock.
     // TODO: AggregationNode and HashJoinNode cannot be "re-opened" yet.
     virtual Status get_next(RuntimeState* state, RowBatch* row_batch, bool* eos) = 0;
+
+    virtual Status get_next(RuntimeState* state, RowBlockV2** row_batch, bool* eos);
 
     // Resets the stream of row batches to be retrieved by subsequent GetNext() calls.
     // Clears all internal state, returning this node to the state it was in after calling
@@ -213,8 +216,8 @@ public:
         return _expr_mem_tracker.get();
     }
 
-    MemPool* expr_mem_pool() { 
-        return _expr_mem_pool.get(); 
+    MemPool* expr_mem_pool() {
+        return _expr_mem_pool.get();
     }
 
     // Extract node id from p->name().
@@ -311,10 +314,10 @@ protected:
     int64_t _num_rows_returned;
 
     boost::scoped_ptr<RuntimeProfile> _runtime_profile;
-   
+
     /// Account for peak memory used by this node
     boost::scoped_ptr<MemTracker> _mem_tracker;
-   
+
     /// MemTracker used by 'expr_mem_pool_'.
     boost::scoped_ptr<MemTracker> _expr_mem_tracker;
 
@@ -332,7 +335,7 @@ protected:
     // "Codegen Enabled"
     boost::mutex _exec_options_lock;
     std::string _runtime_exec_options;
-   
+
     /// Buffer pool client for this node. Initialized with the node's minimum reservation
     /// in ClaimBufferReservation(). After initialization, the client must hold onto at
     /// least the minimum reservation so that it can be returned to the initial

@@ -192,6 +192,11 @@ public class SlotRef extends Expr {
         msg.node_type = TExprNodeType.SLOT_REF;
         msg.slot_ref = new TSlotRef(desc.getId().asInt(), desc.getParent().getId().asInt());
         msg.setOutput_column(outputColumn);
+        if (desc.getColumn() != null) {
+            msg.column_name = desc.getColumn().getName();
+        } else {
+            msg.column_name = "unknown";
+        }
     }
 
     @Override

@@ -17,8 +17,10 @@
 
 package org.apache.doris.analysis;
 
+import com.google.common.collect.Lists;
 import org.apache.doris.catalog.AggregateFunction;
 import org.apache.doris.catalog.Catalog;
+import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Function;
 import org.apache.doris.catalog.FunctionSet;
@@ -266,6 +268,18 @@ public class FunctionCallExpr extends Expr {
         return type.isBitmapType() || type.isHllType();
     }
 
+    // fixme(kks): this has a bug
+    public Column getSlotColumn() {
+        List<SlotRef> slotRefs = Lists.newArrayList();
+        this.collect(SlotRef.class, slotRefs);
+        if (slotRefs.isEmpty()) {
+            return new Column();
+        } else  {
+            SlotRef slotRef = slotRefs.get(0);
+            return slotRef.desc.getColumn();
+        }
+    }
+
     @Override
     protected void toThrift(TExprNode msg) {
         // TODO: we never serialize this to thrift if it's an aggregate function
@@ -278,6 +292,17 @@ public class FunctionCallExpr extends Expr {
         } else {
             msg.node_type = TExprNodeType.FUNCTION_CALL;
         }
+        if (children.size() == 1 && children.get(0).unwrapSlotRef() != null) {
+            SlotRef slotRef = children.get(0).unwrapSlotRef();
+            if (slotRef.desc.getColumn() != null) {
+                msg.column_name = slotRef.desc.getColumn().getName();
+            } else {
+                msg.column_name = "unknown";
+            }
+        } else {
+            msg.column_name = "unknown";
+        }
+
     }
 
     private void analyzeBuiltinAggFunction(Analyzer analyzer) throws AnalysisException {

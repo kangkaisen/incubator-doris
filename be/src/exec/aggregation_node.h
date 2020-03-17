@@ -32,6 +32,7 @@ namespace doris {
 
 class AggFnEvaluator;
 class RowBatch;
+class RowBlockV2;
 class RuntimeState;
 struct StringValue;
 class Tuple;
@@ -58,6 +59,7 @@ public:
     virtual Status prepare(RuntimeState* state);
     virtual Status open(RuntimeState* state);
     virtual Status get_next(RuntimeState* state, RowBatch* row_batch, bool* eos);
+    //virtual Status get_next(RuntimeState* state, RowBlockV2* row_batch, bool* eos);
     virtual Status close(RuntimeState* state);
 
     virtual void debug_string(int indentation_level, std::stringstream* out) const;
@@ -73,7 +75,7 @@ private:
     /// FunctionContext for each agg fn and backing pool.
     std::vector<doris_udf::FunctionContext*> _agg_fn_ctxs;
     boost::scoped_ptr<MemPool> _agg_fn_pool;
-  
+
     // Exprs used to evaluate input rows
     std::vector<ExprContext*> _probe_expr_ctxs;
     // Exprs used to insert constructed aggregation tuple into the hash table.
@@ -88,7 +90,7 @@ private:
     /// the intermediate tuple.
     TupleId _output_tuple_id;
     TupleDescriptor* _output_tuple_desc;
-    
+
     Tuple* _singleton_output_tuple;  // result of aggregation w/o GROUP BY
     boost::scoped_ptr<MemPool> _tuple_pool;
 

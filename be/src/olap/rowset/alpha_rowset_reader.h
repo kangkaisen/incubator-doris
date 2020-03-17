@@ -62,6 +62,8 @@ public:
     // read next block data
     OLAPStatus next_block(RowBlock** block) override;
 
+    OLAPStatus next_block(RowBlockV2** block) override;
+
     bool delete_flag() override;
 
     Version version() override;

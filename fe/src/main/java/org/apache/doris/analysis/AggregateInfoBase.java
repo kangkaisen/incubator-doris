@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.doris.catalog.AggregateFunction;
+import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.FunctionSet;
 import org.apache.doris.catalog.Type;
 import org.slf4j.Logger;
@@ -139,12 +140,15 @@ public abstract class AggregateInfoBase {
             } else {
                 Preconditions.checkArgument(expr instanceof FunctionCallExpr);
                 FunctionCallExpr aggExpr = (FunctionCallExpr)expr;
+                Column slotColumn = aggExpr.getSlotColumn();
                 if (aggExpr.isMergeAggFn()) {
                     slotDesc.setLabel(aggExpr.getChild(0).toSql());
                     slotDesc.setSourceExpr(aggExpr.getChild(0));
+                    slotDesc.setOnlyColumn(slotColumn);
                 } else {
                     slotDesc.setLabel(aggExpr.toSql());
                     slotDesc.setSourceExpr(aggExpr);
+                    slotDesc.setOnlyColumn(slotColumn);
                 }
 
                 // COUNT(), NDV() and NDV_NO_FINALIZE() are non-nullable. The latter two are used

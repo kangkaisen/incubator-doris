@@ -18,6 +18,7 @@
 #pragma once
 
 #include <vector>
+#include <unordered_map>
 
 #include "olap/aggregate_func.h"
 #include "olap/field.h"
@@ -95,12 +96,17 @@ public:
 
     const std::vector<Field*>& columns() const { return _cols; }
     const Field* column(ColumnId cid) const { return _cols[cid]; }
+    const Field* column(const std::string& name) { return _cols[_name_to_id[name]]; }
 
     size_t num_key_columns() const {
         return _num_key_columns;
     }
     size_t schema_size() const {
         return _schema_size;
+    }
+
+    const ColumnId column_id(const std::string& name) {
+        return _name_to_id[name];
     }
 
     size_t column_offset(ColumnId cid) const {
@@ -146,6 +152,8 @@ private:
     // The value of each item indicates the starting offset of the corresponding column in
     // current row. e.g. _col_offsets[idx] is the offset of _cols[idx] (idx must in _col_ids)
     std::vector<size_t> _col_offsets;
+
+    std::unordered_map<std::string, ColumnId> _name_to_id;
 
     size_t _num_key_columns;
     size_t _schema_size;

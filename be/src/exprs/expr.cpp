@@ -82,7 +82,7 @@ FunctionContext* Expr::register_function_context(
 }
 
 // No children here
-Expr::Expr(const Expr& expr) 
+Expr::Expr(const Expr& expr)
         : _cache_entry(expr._cache_entry),
         _node_type(expr._node_type),
         _opcode(expr._opcode),
@@ -394,7 +394,6 @@ Status Expr::create_expr(ObjectPool* pool, const TExprNode& texpr_node, Expr** e
         if (!texpr_node.__isset.slot_ref) {
             return Status::InternalError("Slot reference not set in thrift node");
         }
-
         *expr = pool->add(new SlotRef(texpr_node));
         return Status::OK();
     }
@@ -474,9 +473,9 @@ int Expr::compute_results_layout(
         } else if (exprs[i]->type().type == TYPE_DECIMAL) {
             data[i].byte_size = get_byte_size(exprs[i]->type().type);
 
-            // Although the current decimal has a fix-length, for the 
+            // Although the current decimal has a fix-length, for the
             // same value, it will work out different hash value due to the
-            // different memory represent if the variable_length here is set 
+            // different memory represent if the variable_length here is set
             // to false, so we have to keep it.
             data[i].variable_length = true;
         } else {

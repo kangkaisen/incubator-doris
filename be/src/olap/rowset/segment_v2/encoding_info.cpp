@@ -80,14 +80,14 @@ struct TypeEncodingTraits<type, BIT_SHUFFLE, CppType,
     }
 };
 
-template<>
-struct TypeEncodingTraits<OLAP_FIELD_TYPE_BOOL, RLE, bool> {
+template<FieldType type, typename CppType>
+struct TypeEncodingTraits<type, RLE, CppType> {
     static Status create_page_builder(const PageBuilderOptions& opts, PageBuilder** builder) {
-        *builder = new RlePageBuilder<OLAP_FIELD_TYPE_BOOL>(opts);
+        *builder = new RlePageBuilder<type>(opts);
         return Status::OK();
     }
     static Status create_page_decoder(const Slice& data, const PageDecoderOptions& opts, PageDecoder** decoder) {
-        *decoder = new RlePageDecoder<OLAP_FIELD_TYPE_BOOL>(data, opts);
+        *decoder = new RlePageDecoder<type>(data, opts);
         return Status::OK();
     }
 };

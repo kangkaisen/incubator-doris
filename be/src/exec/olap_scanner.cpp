@@ -23,6 +23,7 @@
 #include "olap_scan_node.h"
 #include "olap_utils.h"
 #include "olap/field.h"
+#include "olap/row_block2.h"
 #include "service/backend_options.h"
 #include "runtime/descriptors.h"
 #include "runtime/runtime_state.h"
@@ -194,12 +195,15 @@ Status OlapScanner::_init_params(
     }
 
     // use _params.return_columns, because reader use this to merge sort
-    OLAPStatus res = _read_row_cursor.init(_tablet->tablet_schema(), _params.return_columns);
-    if (res != OLAP_SUCCESS) {
-        OLAP_LOG_WARNING("fail to init row cursor.[res=%d]", res);
-        return Status::InternalError("failed to initialize storage read row cursor");
-    }
-    _read_row_cursor.allocate_memory_for_string_type(_tablet->tablet_schema());
+    // OLAPStatus res = _read_row_cursor.init(_tablet->tablet_schema(), _params.return_columns);
+    // if (res != OLAP_SUCCESS) {
+    //     OLAP_LOG_WARNING("fail to init row cursor.[res=%d]", res);
+    //     return Status::InternalError("failed to initialize storage read row cursor");
+    // }
+    // _read_row_cursor.allocate_memory_for_string_type(_tablet->tablet_schema());
+
+    Schema schema(_tablet->tablet_schema().columns(), _params.return_columns);
+    _block.reset(new RowBlockV2(schema, 1024));
 
     // If a agg node is this scan node direct parent
     // we will not call agg object finalize method in scan node,
@@ -235,127 +239,134 @@ Status OlapScanner::_init_return_columns() {
 }
 
 Status OlapScanner::get_batch(
-        RuntimeState* state, RowBatch* batch, bool* eof) {
+        RuntimeState* state, RowBlockV2** block, bool* eof) {
     // 2. Allocate Row's Tuple buf
-    uint8_t *tuple_buf = batch->tuple_data_pool()->allocate(
-        state->batch_size() * _tuple_desc->byte_size());
-    bzero(tuple_buf, state->batch_size() * _tuple_desc->byte_size());
-    Tuple *tuple = reinterpret_cast<Tuple*>(tuple_buf);
+    // uint8_t *tuple_buf = batch->tuple_data_pool()->allocate(
+    //     state->batch_size() * _tuple_desc->byte_size());
+    // bzero(tuple_buf, state->batch_size() * _tuple_desc->byte_size());
+    // Tuple *tuple = reinterpret_cast<Tuple*>(tuple_buf);
 
     std::unique_ptr<MemTracker> tracker(new MemTracker(state->fragment_mem_tracker()->limit()));
     std::unique_ptr<MemPool> mem_pool(new MemPool(tracker.get()));
 
-    int64_t raw_rows_threshold = raw_rows_read() + config::doris_scanner_row_num;
-    {
-        SCOPED_TIMER(_parent->_scan_timer);
-        while (true) {
-            // Batch is full, break
-            if (batch->is_full()) {
-                _update_realtime_counter();
-                break;
-            }
-            // Read one row from reader
-            auto res = _reader->next_row_with_aggregation(&_read_row_cursor, mem_pool.get(), batch->agg_object_pool(), eof);
-            if (res != OLAP_SUCCESS) {
-                return Status::InternalError("Internal Error: read storage fail.");
-            }
-            // If we reach end of this scanner, break
-            if (UNLIKELY(*eof)) {
-                break;
-            }
-
-            _num_rows_read++;
-
-            _convert_row_to_tuple(tuple);
-            if (VLOG_ROW_IS_ON) {
-                VLOG_ROW << "OlapScanner input row: " << Tuple::to_string(tuple, *_tuple_desc);
-            }
-
-            // 3.4 Set tuple to RowBatch(not commited)
-            int row_idx = batch->add_row();
-            TupleRow* row = batch->get_row(row_idx);
-            row->set_tuple(_tuple_idx, tuple);
-
-            do {
-                // 3.5.1 Using direct conjuncts to filter data
-                if (_eval_conjuncts_fn != nullptr) {
-                    if (!_eval_conjuncts_fn(&_conjunct_ctxs[0], _direct_conjunct_size, row)) {
-                        // check direct conjuncts fail then clear tuple for reuse
-                        // make sure to reset null indicators since we're overwriting
-                        // the tuple assembled for the previous row
-                        tuple->init(_tuple_desc->byte_size());
-                        break;
-                    }
-                } else {
-                    if (!ExecNode::eval_conjuncts(&_conjunct_ctxs[0], _direct_conjunct_size, row)) {
-                        // check direct conjuncts fail then clear tuple for reuse
-                        // make sure to reset null indicators since we're overwriting
-                        // the tuple assembled for the previous row
-                        tuple->init(_tuple_desc->byte_size());
-                        break;
-                    }
-                }
-
-                // 3.5.2 Using pushdown conjuncts to filter data
-                if (_use_pushdown_conjuncts) {
-                    if (!ExecNode::eval_conjuncts(
-                            &_conjunct_ctxs[_direct_conjunct_size],
-                            _conjunct_ctxs.size() - _direct_conjunct_size, row)) {
-                        // check pushdown conjuncts fail then clear tuple for reuse
-                        // make sure to reset null indicators since we're overwriting
-                        // the tuple assembled for the previous row
-                        tuple->init(_tuple_desc->byte_size());
-                        _num_rows_pushed_cond_filtered++;
-                        break;
-                    }
-                }
-
-                // Copy string slot
-                for (auto desc : _string_slots) {
-                    StringValue* slot = tuple->get_string_slot(desc->tuple_offset());
-                    if (slot->len != 0) {
-                        uint8_t* v = batch->tuple_data_pool()->allocate(slot->len);
-                        memory_copy(v, slot->ptr, slot->len);
-                        slot->ptr = reinterpret_cast<char*>(v);
-                    }
-                }
-
-                // the memory allocate by mem pool has been copied,
-                // so we should release these memory immediately
-                mem_pool->clear();
-
-                if (VLOG_ROW_IS_ON) {
-                    VLOG_ROW << "OlapScanner output row: " << Tuple::to_string(tuple, *_tuple_desc);
-                }
-
-                // check direct && pushdown conjuncts success then commit tuple
-                batch->commit_last_row();
-                char* new_tuple = reinterpret_cast<char*>(tuple);
-                new_tuple += _tuple_desc->byte_size();
-                tuple = reinterpret_cast<Tuple*>(new_tuple);
-
-                // compute pushdown conjuncts filter rate
-                if (_use_pushdown_conjuncts) {
-                    // check this rate after
-                    if (_num_rows_read > 32768) {
-                        int32_t pushdown_return_rate
-                            = _num_rows_read * 100 / (_num_rows_read + _num_rows_pushed_cond_filtered);
-                        if (pushdown_return_rate > config::doris_max_pushdown_conjuncts_return_rate) {
-                            _use_pushdown_conjuncts = false;
-                            VLOG(2) << "Stop Using PushDown Conjuncts. "
-                                << "PushDownReturnRate: " << pushdown_return_rate << "%"
-                                << " MaxPushDownReturnRate: "
-                                << config::doris_max_pushdown_conjuncts_return_rate << "%";
-                        }
-                    }
-                }
-            } while (false);
-
-            if (raw_rows_read() >= raw_rows_threshold) {
-                break;
-            }
-        }
+    ObjectPool objectPool;
+    SCOPED_TIMER(_parent->_scan_timer);
+    auto res = _reader->next_block(block, mem_pool.get(), &objectPool, eof);
+    if (UNLIKELY(res != OLAP_SUCCESS)) {
+        return Status::InternalError("Internal Error: read storage fail.");
     }
+
+    // int64_t raw_rows_threshold = raw_rows_read() + config::doris_scanner_row_num;
+    // {
+    //     SCOPED_TIMER(_parent->_scan_timer);
+    //     while (true) {
+    //         // Batch is full, break
+    //         if (batch->is_full()) {
+    //             _update_realtime_counter();
+    //             break;
+    //         }
+    //         // Read one row from reader
+    //         auto res = _reader->next_row_with_aggregation(&_read_row_cursor, mem_pool.get(), batch->agg_object_pool(), eof);
+    //         if (res != OLAP_SUCCESS) {
+    //             return Status::InternalError("Internal Error: read storage fail.");
+    //         }
+    //         // If we reach end of this scanner, break
+    //         if (UNLIKELY(*eof)) {
+    //             break;
+    //         }
+
+    //         _num_rows_read++;
+
+    //         _convert_row_to_tuple(tuple);
+    //         if (VLOG_ROW_IS_ON) {
+    //             VLOG_ROW << "OlapScanner input row: " << Tuple::to_string(tuple, *_tuple_desc);
+    //         }
+
+    //         // 3.4 Set tuple to RowBatch(not commited)
+    //         int row_idx = batch->add_row();
+    //         TupleRow* row = batch->get_row(row_idx);
+    //         row->set_tuple(_tuple_idx, tuple);
+
+    //         do {
+    //             // 3.5.1 Using direct conjuncts to filter data
+    //             if (_eval_conjuncts_fn != nullptr) {
+    //                 if (!_eval_conjuncts_fn(&_conjunct_ctxs[0], _direct_conjunct_size, row)) {
+    //                     // check direct conjuncts fail then clear tuple for reuse
+    //                     // make sure to reset null indicators since we're overwriting
+    //                     // the tuple assembled for the previous row
+    //                     tuple->init(_tuple_desc->byte_size());
+    //                     break;
+    //                 }
+    //             } else {
+    //                 if (!ExecNode::eval_conjuncts(&_conjunct_ctxs[0], _direct_conjunct_size, row)) {
+    //                     // check direct conjuncts fail then clear tuple for reuse
+    //                     // make sure to reset null indicators since we're overwriting
+    //                     // the tuple assembled for the previous row
+    //                     tuple->init(_tuple_desc->byte_size());
+    //                     break;
+    //                 }
+    //             }
+
+    //             // 3.5.2 Using pushdown conjuncts to filter data
+    //             if (_use_pushdown_conjuncts) {
+    //                 if (!ExecNode::eval_conjuncts(
+    //                         &_conjunct_ctxs[_direct_conjunct_size],
+    //                         _conjunct_ctxs.size() - _direct_conjunct_size, row)) {
+    //                     // check pushdown conjuncts fail then clear tuple for reuse
+    //                     // make sure to reset null indicators since we're overwriting
+    //                     // the tuple assembled for the previous row
+    //                     tuple->init(_tuple_desc->byte_size());
+    //                     _num_rows_pushed_cond_filtered++;
+    //                     break;
+    //                 }
+    //             }
+
+    //             // Copy string slot
+    //             for (auto desc : _string_slots) {
+    //                 StringValue* slot = tuple->get_string_slot(desc->tuple_offset());
+    //                 if (slot->len != 0) {
+    //                     uint8_t* v = batch->tuple_data_pool()->allocate(slot->len);
+    //                     memory_copy(v, slot->ptr, slot->len);
+    //                     slot->ptr = reinterpret_cast<char*>(v);
+    //                 }
+    //             }
+
+    //             // the memory allocate by mem pool has been copied,
+    //             // so we should release these memory immediately
+    //             mem_pool->clear();
+
+    //             if (VLOG_ROW_IS_ON) {
+    //                 VLOG_ROW << "OlapScanner output row: " << Tuple::to_string(tuple, *_tuple_desc);
+    //             }
+
+    //             // check direct && pushdown conjuncts success then commit tuple
+    //             batch->commit_last_row();
+    //             char* new_tuple = reinterpret_cast<char*>(tuple);
+    //             new_tuple += _tuple_desc->byte_size();
+    //             tuple = reinterpret_cast<Tuple*>(new_tuple);
+
+    //             // compute pushdown conjuncts filter rate
+    //             if (_use_pushdown_conjuncts) {
+    //                 // check this rate after
+    //                 if (_num_rows_read > 32768) {
+    //                     int32_t pushdown_return_rate
+    //                         = _num_rows_read * 100 / (_num_rows_read + _num_rows_pushed_cond_filtered);
+    //                     if (pushdown_return_rate > config::doris_max_pushdown_conjuncts_return_rate) {
+    //                         _use_pushdown_conjuncts = false;
+    //                         VLOG(2) << "Stop Using PushDown Conjuncts. "
+    //                             << "PushDownReturnRate: " << pushdown_return_rate << "%"
+    //                             << " MaxPushDownReturnRate: "
+    //                             << config::doris_max_pushdown_conjuncts_return_rate << "%";
+    //                     }
+    //                 }
+    //             }
+    //         } while (false);
+
+    //         if (raw_rows_read() >= raw_rows_threshold) {
+    //             break;
+    //         }
+    //     }
+    // }
 
     return Status::OK();
 }

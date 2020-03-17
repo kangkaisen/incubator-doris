@@ -42,7 +42,8 @@ OLAPStatus BetaRowsetReader::init(RowsetReaderContext* read_context) {
         _stats = _context->stats;
     }
     // SegmentIterator will load seek columns on demand
-    Schema schema(_context->tablet_schema->columns(), *(_context->return_columns));
+    //Schema schema(_context->tablet_schema->columns(), *(_context->return_columns));
+    _schema.reset(new Schema (_context->tablet_schema->columns(), *(_context->return_columns)));
 
     // convert RowsetReaderContext to StorageReadOptions
     StorageReadOptions read_options;
@@ -68,7 +69,7 @@ OLAPStatus BetaRowsetReader::init(RowsetReaderContext* read_context) {
     std::vector<std::unique_ptr<RowwiseIterator>> seg_iterators;
     for (auto& seg_ptr : _rowset->_segments) {
         std::unique_ptr<RowwiseIterator> iter;
-        auto s = seg_ptr->new_iterator(schema, read_options, &iter);
+        auto s = seg_ptr->new_iterator(*_schema, read_options, &iter);
         if (!s.ok()) {
             LOG(WARNING) << "failed to create iterator[" << seg_ptr->id() << "]: " << s.to_string();
             return OLAP_ERR_ROWSET_READER_INIT;
@@ -96,19 +97,19 @@ OLAPStatus BetaRowsetReader::init(RowsetReaderContext* read_context) {
     _iterator.reset(final_iterator);
 
     // init input block
-    _input_block.reset(new RowBlockV2(schema, 1024));
+    //_input_block.reset(new RowBlockV2(schema, 1024));
 
-    // init output block and row
-    _output_block.reset(new RowBlock(read_context->tablet_schema));
-    RowBlockInfo output_block_info;
-    output_block_info.row_num = 1024;
-    output_block_info.null_supported = true;
-    // the output block's schema should be seek_columns to comform to v1
-    // TODO(hkp): this should be optimized to use return_columns
-    output_block_info.column_ids = *(_context->seek_columns);
-    RETURN_NOT_OK(_output_block->init(output_block_info));
-    _row.reset(new RowCursor());
-    RETURN_NOT_OK(_row->init(*(read_context->tablet_schema), *(_context->seek_columns)));
+    // // init output block and row
+    // _output_block.reset(new RowBlock(read_context->tablet_schema));
+    // RowBlockInfo output_block_info;
+    // output_block_info.row_num = 1024;
+    // output_block_info.null_supported = true;
+    // // the output block's schema should be seek_columns to comform to v1
+    // // TODO(hkp): this should be optimized to use return_columns
+    // output_block_info.column_ids = *(_context->seek_columns);
+    // RETURN_NOT_OK(_output_block->init(output_block_info));
+    // _row.reset(new RowCursor());
+    // RETURN_NOT_OK(_row->init(*(read_context->tablet_schema), *(_context->seek_columns)));
 
     return OLAP_SUCCESS;
 }
@@ -136,6 +137,27 @@ OLAPStatus BetaRowsetReader::next_block(RowBlock** block) {
         _input_block->convert_to_row_block(_row.get(), _output_block.get());
     }
     *block = _output_block.get();
+    return OLAP_SUCCESS;
+}
+
+OLAPStatus BetaRowsetReader::next_block(RowBlockV2** block) {
+    // read next input block
+    RowBlockV2* _input_block = new RowBlockV2(*_schema, config::row_block_v2_size);
+    {
+        SCOPED_RAW_TIMER(&_stats->block_fetch_ns);
+        auto s = _iterator->next_batch(_input_block);
+        if (!s.ok()) {
+            if (s.is_end_of_file()) {
+                *block = nullptr;
+                return OLAP_ERR_DATA_EOF;
+            }
+            return OLAP_ERR_ROWSET_READ_FAILED;
+        }
+    }
+
+    *block = _input_block;
+    _row_count += (*block)->selected_size();
+    _blocks.emplace_back(_input_block);
     return OLAP_SUCCESS;
 }
 

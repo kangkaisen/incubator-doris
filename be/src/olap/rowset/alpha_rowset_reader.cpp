@@ -99,6 +99,10 @@ OLAPStatus AlphaRowsetReader::next_block(RowBlock** block) {
     return (this->*_next_block)(block);
 }
 
+OLAPStatus AlphaRowsetReader::next_block(RowBlockV2** block) {
+    return OLAP_SUCCESS;
+}
+
 bool AlphaRowsetReader::delete_flag() {
     return _alpha_rowset_meta->delete_flag();
 }
@@ -192,7 +196,7 @@ OLAPStatus AlphaRowsetReader::_update_merge_ctx_and_build_merge_heap(AlphaMergeC
     if (merge_ctx->is_eof) {
         // nothing in this merge ctx, just return
         return OLAP_SUCCESS;
-    }  
+    }
 
     // get next row block of this merge ctx
     if (merge_ctx->row_block == nullptr || !merge_ctx->row_block->has_remaining()) {

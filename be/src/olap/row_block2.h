@@ -80,6 +80,11 @@ public:
         return ColumnBlock(type_info, data, null_bitmap, _capacity, _pool.get());
     }
 
+    ColumnBlock column_block(const std::string& name) {
+        ColumnId cid = _schema.column_id(name);
+        return column_block(cid);
+    }
+
     // low-level API to access the underlying memory for row at `row_idx`.
     // client should use selection_vector() to iterate over row index of selected rows.
     // TODO(gdy) DO NOT expose raw rows which may be un-selected to clients
@@ -127,7 +132,7 @@ private:
     std::unique_ptr<MemPool> _pool;
 
     // index of selected rows for rows passed the predicate
-    uint16_t* _selection_vector;
+    uint16_t* _selection_vector = nullptr;
     // selected rows number
     uint16_t _selected_size;
 

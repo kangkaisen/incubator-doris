@@ -53,8 +53,9 @@ using doris_udf::AnyVal;
 // Delimiter to use if the separator is NULL.
 static const StringVal DEFAULT_STRING_CONCAT_DELIM((uint8_t*)", ", 2);
 
+// fixme(kks)
 void AggregateFunctions::init_null(FunctionContext*, AnyVal* dst) {
-    dst->is_null = true;
+    dst->is_null = false;
 }
 
 template<typename T>

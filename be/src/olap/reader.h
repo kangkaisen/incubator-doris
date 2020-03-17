@@ -44,6 +44,7 @@ namespace doris {
 class Tablet;
 class RowCursor;
 class RowBlock;
+class RowBlockV2;
 class CollectIterator;
 class RuntimeState;
 
@@ -135,6 +136,8 @@ public:
     OLAPStatus next_row_with_aggregation(RowCursor *row_cursor, MemPool* mem_pool, ObjectPool* agg_pool, bool *eof) {
         return (this->*_next_row_func)(row_cursor, mem_pool, agg_pool, eof);
     }
+
+    OLAPStatus next_block(RowBlockV2** block, MemPool* mem_pool, ObjectPool* agg_pool, bool *eof);
 
     uint64_t merged_rows() const {
         return _merged_rows;
@@ -249,6 +252,7 @@ private:
     ReaderType _reader_type;
     bool _next_delete_flag;
     const RowCursor* _next_key;
+    //const RowBlockV2* _next_block;
     CollectIterator* _collect_iter = nullptr;
     std::vector<uint32_t> _key_cids;
     std::vector<uint32_t> _value_cids;

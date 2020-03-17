@@ -207,7 +207,7 @@ Status ExecNode::reset(RuntimeState* state) {
     _num_rows_returned = 0;
     for (int i = 0; i < _children.size(); ++i) {
         RETURN_IF_ERROR(_children[i]->reset(state));
-    }   
+    }
     return Status::OK();
 }
 
@@ -215,7 +215,12 @@ Status ExecNode::collect_query_statistics(QueryStatistics* statistics) {
     DCHECK(statistics != nullptr);
     for (auto child_node : _children) {
         child_node->collect_query_statistics(statistics);
-    } 
+    }
+    return Status::OK();
+}
+
+Status ExecNode::get_next(RuntimeState* state, RowBlockV2** row_batch, bool* eos) {
+    LOG(WARNING) << "ExecNode::get_next run";
     return Status::OK();
 }
 
@@ -251,10 +256,10 @@ Status ExecNode::close(RuntimeState* state) {
         state->exec_env()->buffer_pool()->DeregisterClient(&_buffer_pool_client);
     }
 
-    if (_expr_mem_tracker != nullptr) { 
+    if (_expr_mem_tracker != nullptr) {
         _expr_mem_tracker->close();
     }
-  
+
     if (_mem_tracker != nullptr) {
         _mem_tracker->close();
     }
@@ -592,22 +597,22 @@ Status ExecNode::claim_buffer_reservation(RuntimeState* state) {
     BufferPool* buffer_pool = ExecEnv::GetInstance()->buffer_pool();
     // Check the minimum buffer size in case the minimum buffer size used by the planner
     // doesn't match this backend's.
-        std::stringstream ss; 
+        std::stringstream ss;
     if (_resource_profile.__isset.spillable_buffer_size &&
         _resource_profile.spillable_buffer_size < buffer_pool->min_buffer_len()) {
         ss << "Spillable buffer size for node " << _id << " of " << _resource_profile.spillable_buffer_size
            << "bytes is less than the minimum buffer pool buffer size of "
            <<  buffer_pool->min_buffer_len() << "bytes";
         return Status::InternalError(ss.str());
-    }   
- 
+    }
+
     ss << print_plan_node_type(_type) << " id=" << _id << " ptr=" << this;
     RETURN_IF_ERROR(buffer_pool->RegisterClient(ss.str(),
                                                 state->instance_buffer_reservation(),
-                                                mem_tracker(), _resource_profile.max_reservation, 
+                                                mem_tracker(), _resource_profile.max_reservation,
                                                 runtime_profile(),
                                                 &_buffer_pool_client));
-    
+
     state->initial_reservations()->Claim(&_buffer_pool_client, _resource_profile.min_reservation);
 /*
     if (debug_action_ == TDebugAction::SET_DENY_RESERVATION_PROBABILITY &&
@@ -616,8 +621,8 @@ Status ExecNode::claim_buffer_reservation(RuntimeState* state) {
        // Open() because the client is not registered then. Do it now to be sure that it is
        // effective.
                RETURN_IF_ERROR(EnableDenyReservationDebugAction());
-    } 
-*/  
+    }
+*/
     return Status::OK();
 }
 

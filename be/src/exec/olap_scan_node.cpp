@@ -34,6 +34,7 @@
 #include "runtime/row_batch.h"
 #include "runtime/string_value.h"
 #include "runtime/tuple_row.h"
+#include "olap/row_block2.h"
 #include "util/runtime_profile.h"
 #include "util/debug_util.h"
 #include "util/priority_thread_pool.hpp"
@@ -57,7 +58,7 @@ OlapScanNode::OlapScanNode(ObjectPool* pool, const TPlanNode& tnode, const Descr
         _start(false),
         _scanner_done(false),
         _transfer_done(false),
-        _wait_duration(0, 0, 1, 0),
+        _wait_duration(0, 0, 0, 500),
         _status(Status::OK()),
         _resource_info(nullptr),
         _buffered_bytes(0),
@@ -161,19 +162,19 @@ Status OlapScanNode::prepare(RuntimeState* state) {
         return Status::InternalError("Failed to get tuple descriptor.");
     }
 
-    const std::vector<SlotDescriptor*>& slots = _tuple_desc->slots();
+    // const std::vector<SlotDescriptor*>& slots = _tuple_desc->slots();
 
-    for (int i = 0; i < slots.size(); ++i) {
-        if (!slots[i]->is_materialized()) {
-            continue;
-        }
+    // for (int i = 0; i < slots.size(); ++i) {
+    //     if (!slots[i]->is_materialized()) {
+    //         continue;
+    //     }
 
-        if (!slots[i]->type().is_string_type()) {
-            continue;
-        }
+    //     if (!slots[i]->type().is_string_type()) {
+    //         continue;
+    //     }
 
-        _string_slots.push_back(slots[i]);
-    }
+    //     _string_slots.push_back(slots[i]);
+    // }
 
     _runtime_state = state;
     return Status::OK();
@@ -184,7 +185,7 @@ Status OlapScanNode::open(RuntimeState* state) {
     SCOPED_TIMER(_runtime_profile->total_time_counter());
     RETURN_IF_CANCELLED(state);
     RETURN_IF_ERROR(ExecNode::open(state));
-   
+
     for (int conj_idx = 0; conj_idx < _conjunct_ctxs.size(); ++conj_idx) {
         // if conjunct is constant, compute direct and set eos = true
 
@@ -202,12 +203,16 @@ Status OlapScanNode::open(RuntimeState* state) {
 }
 
 Status OlapScanNode::get_next(RuntimeState* state, RowBatch* row_batch, bool* eos) {
+    return Status::OK();
+}
+
+Status OlapScanNode::get_next(RuntimeState* state, RowBlockV2** block, bool* eos) {
     RETURN_IF_ERROR(exec_debug_action(TExecNodePhase::GETNEXT));
     SCOPED_TIMER(_runtime_profile->total_time_counter());
 
     // check if Canceled.
     if (state->is_cancelled()) {
-        boost::unique_lock<boost::mutex> l(_row_batches_lock);
+        boost::unique_lock<boost::mutex> l(_scan_batches_lock);
         _transfer_done = true;
         boost::lock_guard<SpinLock> guard(_status_mutex);
         if (LIKELY(_status.ok())) {
@@ -221,77 +226,48 @@ Status OlapScanNode::get_next(RuntimeState* state, RowBatch* row_batch, bool* eo
         return Status::OK();
     }
 
-    // check if started.
     if (!_start) {
-        Status status = start_scan(state);
-
-        if (!status.ok()) {
-            LOG(ERROR) << "StartScan Failed cause " << status.get_error_msg();
-            *eos = true;
-            return status;
+        for (auto& scan_range : _scan_ranges) {
+            std::vector<OlapScanRange*> scanner_ranges;
+            scanner_ranges.push_back(new OlapScanRange());
+            OlapScanner* scanner = new OlapScanner(
+                state, this, _olap_scan_node.is_preaggregation, _need_agg_finalize, *scan_range, scanner_ranges);
+            _olap_scanners.push_back(scanner);
         }
 
+        // init progress
+        // std::stringstream ss;
+        // ss << "ScanThread complete (node=" << id() << "):";
+        // _progress = ProgressUpdater(ss.str(), _olap_scanners.size(), 1);
+        // _progress.set_logging_level(1);
+
+        _transfer_thread.add_thread(new boost::thread(&OlapScanNode::scanner_thread, this));
         _start = true;
     }
 
     // wait for batch from queue
-    RowBatch* materialized_batch = NULL;
+    RowBlockV2* materialized_batch = NULL;
     {
-        boost::unique_lock<boost::mutex> l(_row_batches_lock);
-        while (_materialized_row_batches.empty() && !_transfer_done) {
+        boost::unique_lock<boost::mutex> l(_scan_batches_lock);
+        while (_scan_row_batches.empty() && !_transfer_done) {
             if (state->is_cancelled()) {
                 _transfer_done = true;
             }
-
-            _row_batch_added_cv.timed_wait(l, _wait_duration);
+            _scan_batch_added_cv.timed_wait(l, _wait_duration);
         }
 
-        if (!_materialized_row_batches.empty()) {
-            materialized_batch = dynamic_cast<RowBatch*>(_materialized_row_batches.front());
-            DCHECK(materialized_batch != NULL);
-            _materialized_row_batches.pop_front();
+        if (!_scan_row_batches.empty()) {
+            materialized_batch = _scan_row_batches.front();
+            _scan_row_batches.pop_front();
         }
     }
 
     // return batch
-    if (NULL != materialized_batch) {
+    if (nullptr != materialized_batch) {
         // notify scanner
-        _row_batch_consumed_cv.notify_one();
-        // get scanner's batch memory
-        row_batch->acquire_state(materialized_batch);
-        _num_rows_returned += row_batch->num_rows();
-        COUNTER_SET(_rows_returned_counter, _num_rows_returned);
-
-        // reach scan node limit
-        if (reached_limit()) {
-            int num_rows_over = _num_rows_returned - _limit;
-            row_batch->set_num_rows(row_batch->num_rows() - num_rows_over);
-            _num_rows_returned -= num_rows_over;
-            COUNTER_SET(_rows_returned_counter, _num_rows_returned);
-
-            {
-                boost::unique_lock<boost::mutex> l(_row_batches_lock);
-                _transfer_done = true;
-            }
-
-            _row_batch_consumed_cv.notify_all();
-            *eos = true;
-            LOG(INFO) << "OlapScanNode ReachedLimit.";
-        } else {
-            *eos = false;
-        }
-
-        if (VLOG_ROW_IS_ON) {
-            for (int i = 0; i < row_batch->num_rows(); ++i) {
-                TupleRow* row = row_batch->get_row(i);
-                VLOG_ROW << "OlapScanNode output row: "
-                    << Tuple::to_string(row->get_tuple(0), *_tuple_desc);
-            }
-        }
-        __sync_fetch_and_sub(&_buffered_bytes,
-                             row_batch->tuple_data_pool()->total_reserved_bytes());
-
-        delete materialized_batch;
+        // _row_batch_consumed_cv.notify_one();
+        *block = materialized_batch;
+        *eos = false;
         return Status::OK();
     }
 
@@ -320,25 +296,25 @@ Status OlapScanNode::close(RuntimeState* state) {
         _transfer_done = true;
     }
     // notify all scanner thread
-    _row_batch_consumed_cv.notify_all();
-    _row_batch_added_cv.notify_all();
+    // _row_batch_consumed_cv.notify_all();
+    // _row_batch_added_cv.notify_all();
     _scan_batch_added_cv.notify_all();
 
-    // join transfer thread
+    //join transfer thread
     _transfer_thread.join_all();
 
     // clear some row batch in queue
-    for (auto row_batch : _materialized_row_batches) {
-        delete row_batch;
-    }
+    // for (auto row_batch : _materialized_row_batches) {
+    //     delete row_batch;
+    // }
 
-    _materialized_row_batches.clear();
+    // _materialized_row_batches.clear();
 
-    for (auto row_batch : _scan_row_batches) {
-        delete row_batch;
-    }
+    // for (auto row_batch : _scan_row_batches) {
+    //     delete row_batch;
+    // }
 
-    _scan_row_batches.clear();
+    // _scan_row_batches.clear();
 
     // OlapScanNode terminate by exception
     // so that initiative close the Scanner
@@ -451,7 +427,7 @@ Status OlapScanNode::normalize_conjuncts() {
         }
 
         case TYPE_CHAR:
-        case TYPE_VARCHAR: 
+        case TYPE_VARCHAR:
         case TYPE_HLL: {
             static char min_char = 0x00;
             static char max_char = 0xff;
@@ -564,156 +540,74 @@ Status OlapScanNode::build_scan_key() {
     return Status::OK();
 }
 
-static Status get_hints(
-        const TPaloScanRange& scan_range,
-        int block_row_count,
-        bool is_begin_include,
-        bool is_end_include,
-        const std::vector<std::unique_ptr<OlapScanRange>>& scan_key_range,
-        std::vector<std::unique_ptr<OlapScanRange>>* sub_scan_range, 
-        RuntimeProfile* profile) {
-    auto tablet_id = scan_range.tablet_id;
-    int32_t schema_hash = strtoul(scan_range.schema_hash.c_str(), NULL, 10);
-    std::string err;
-    TabletSharedPtr table = StorageEngine::instance()->tablet_manager()->get_tablet(
-        tablet_id, schema_hash, true, &err);
-    if (table == nullptr) {
-        std::stringstream ss;
-        ss << "failed to get tablet: " << tablet_id << "with schema hash: "
-            << schema_hash << ", reason: " << err;
-        LOG(WARNING) << ss.str();
-        return Status::InternalError(ss.str());
-    }
-
-    RuntimeProfile::Counter* show_hints_timer = profile->get_counter("ShowHintsTime");
-    std::vector<std::vector<OlapTuple>> ranges;
-    bool have_valid_range = false;
-    for (auto& key_range : scan_key_range) {
-        if (key_range->begin_scan_range.size() == 1 
-                && key_range->begin_scan_range.get_value(0) == NEGATIVE_INFINITY) {
-            continue;
-        }
-        SCOPED_TIMER(show_hints_timer);
-    
-        OLAPStatus res = OLAP_SUCCESS;
-        std::vector<OlapTuple> range;
-        res = table->split_range(key_range->begin_scan_range,
-                                 key_range->end_scan_range,
-                                 block_row_count, &range);
-        if (res != OLAP_SUCCESS) {
-            OLAP_LOG_WARNING("fail to show hints by split range. [res=%d]", res);
-            return Status::InternalError("fail to show hints");
-        }
-        ranges.emplace_back(std::move(range));
-        have_valid_range = true;
-    }
-
-    if (!have_valid_range) {
-        std::vector<OlapTuple> range;
-        auto res = table->split_range({}, {}, block_row_count, &range);
-        if (res != OLAP_SUCCESS) {
-            OLAP_LOG_WARNING("fail to show hints by split range. [res=%d]", res);
-            return Status::InternalError("fail to show hints");
-        }
-        ranges.emplace_back(std::move(range));
-    }
-
-    for (int i = 0; i < ranges.size(); ++i) {
-        for (int j = 0; j < ranges[i].size(); j += 2) {
-            std::unique_ptr<OlapScanRange> range(new OlapScanRange);
-            range->begin_scan_range.reset();
-            range->begin_scan_range = ranges[i][j];
-            range->end_scan_range.reset();
-            range->end_scan_range = ranges[i][j + 1];
-
-            if (0 == j) {
-                range->begin_include = is_begin_include;
-            } else {
-                range->begin_include = true;
-            }
-
-            if (j + 2 == ranges[i].size()) {
-                range->end_include = is_end_include;
-            } else {
-                range->end_include = false;
-            }
-
-            sub_scan_range->emplace_back(std::move(range));
-        }
-    }
-
-    return Status::OK();
-}
-
-
 Status OlapScanNode::start_scan_thread(RuntimeState* state) {
-    if (_scan_ranges.empty()) {
-        _transfer_done = true;
-        return Status::OK();
-    }
+    // if (_scan_ranges.empty()) {
+    //     _transfer_done = true;
+    //     return Status::OK();
+    // }
 
-    // ranges constructed from scan keys
-    std::vector<std::unique_ptr<OlapScanRange>> cond_ranges;
-    RETURN_IF_ERROR(_scan_keys.get_key_range(&cond_ranges));
-    // if we can't get ranges from conditions, we give it a total range
-    if (cond_ranges.empty()) {
-        cond_ranges.emplace_back(new OlapScanRange());
-    }
+    // // ranges constructed from scan keys
+    // std::vector<std::unique_ptr<OlapScanRange>> cond_ranges;
+    // RETURN_IF_ERROR(_scan_keys.get_key_range(&cond_ranges));
+    // // if we can't get ranges from conditions, we give it a total range
+    // if (cond_ranges.empty()) {
+    //     cond_ranges.emplace_back(new OlapScanRange());
+    // }
 
-    bool need_split = true;
-    // If we have ranges more than 64, there is no need to call
-    // ShowHint to split ranges
-    if (limit() != -1 || cond_ranges.size() > 64) {
-        need_split = false;
-    }
+    // bool need_split = true;
+    // // If we have ranges more than 64, there is no need to call
+    // // ShowHint to split ranges
+    // if (limit() != -1 || cond_ranges.size() > 64) {
+    //     need_split = false;
+    // }
 
-    int scanners_per_tablet = std::max(1, 64 / (int)_scan_ranges.size());
-    for (auto& scan_range : _scan_ranges) {
-        std::vector<std::unique_ptr<OlapScanRange>>* ranges = &cond_ranges;
-        std::vector<std::unique_ptr<OlapScanRange>> split_ranges;
-        if (need_split) {
-            auto st = get_hints(
-                    *scan_range,
-                    config::doris_scan_range_row_count,
-                    _scan_keys.begin_include(),
-                    _scan_keys.end_include(),
-                    cond_ranges,
-                    &split_ranges,
-                    _runtime_profile.get());
-            if (st.ok()) {
-                ranges = &split_ranges;
-            }
-        }
+    // int scanners_per_tablet = std::max(1, 64 / (int)_scan_ranges.size());
+    // for (auto& scan_range : _scan_ranges) {
+    //     std::vector<std::unique_ptr<OlapScanRange>>* ranges = &cond_ranges;
+    //     std::vector<std::unique_ptr<OlapScanRange>> split_ranges;
+    //     if (need_split) {
+    //         auto st = get_hints(
+    //                 *scan_range,
+    //                 config::doris_scan_range_row_count,
+    //                 _scan_keys.begin_include(),
+    //                 _scan_keys.end_include(),
+    //                 cond_ranges,
+    //                 &split_ranges,
+    //                 _runtime_profile.get());
+    //         if (st.ok()) {
+    //             ranges = &split_ranges;
+    //         }
+    //     }
 
-        int ranges_per_scanner = std::max(1, (int)ranges->size() / scanners_per_tablet);
-        int num_ranges = ranges->size();
-        for (int i = 0; i < num_ranges;) {
-            std::vector<OlapScanRange*> scanner_ranges;
-            scanner_ranges.push_back((*ranges)[i].get());
-            ++i;
-            for (int j = 1;
-                 i < num_ranges &&
-                 j < ranges_per_scanner &&
-                 (*ranges)[i]->end_include == (*ranges)[i - 1]->end_include;
-                 ++j, ++i) {
-                scanner_ranges.push_back((*ranges)[i].get());
-            }
-            OlapScanner* scanner = new OlapScanner(
-                state, this, _olap_scan_node.is_preaggregation, _need_agg_finalize, *scan_range, scanner_ranges);
-            _scanner_pool->add(scanner);
-            _olap_scanners.push_back(scanner);
-        }
-    }
+    //     int ranges_per_scanner = std::max(1, (int)ranges->size() / scanners_per_tablet);
+    //     int num_ranges = ranges->size();
+    //     for (int i = 0; i < num_ranges;) {
+    //         std::vector<OlapScanRange*> scanner_ranges;
+    //         scanner_ranges.push_back((*ranges)[i].get());
+    //         ++i;
+    //         for (int j = 1;
+    //              i < num_ranges &&
+    //              j < ranges_per_scanner &&
+    //              (*ranges)[i]->end_include == (*ranges)[i - 1]->end_include;
+    //              ++j, ++i) {
+    //             scanner_ranges.push_back((*ranges)[i].get());
+    //         }
+    //         OlapScanner* scanner = new OlapScanner(
+    //             state, this, _olap_scan_node.is_preaggregation, _need_agg_finalize, *scan_range, scanner_ranges);
+    //         _scanner_pool->add(scanner);
+    //         _olap_scanners.push_back(scanner);
+    //     }
+    // }
 
-    // init progress
-    std::stringstream ss;
-    ss << "ScanThread complete (node=" << id() << "):";
-    _progress = ProgressUpdater(ss.str(), _olap_scanners.size(), 1);
-    _progress.set_logging_level(1);
+    // // init progress
+    // std::stringstream ss;
+    // ss << "ScanThread complete (node=" << id() << "):";
+    // _progress = ProgressUpdater(ss.str(), _olap_scanners.size(), 1);
+    // _progress.set_logging_level(1);
 
-    _transfer_thread.add_thread(
-        new boost::thread(
-            &OlapScanNode::transfer_thread, this, state));
+    // _transfer_thread.add_thread(
+    //     new boost::thread(
+    //         &OlapScanNode::transfer_thread, this, state));
 
     return Status::OK();
 }
@@ -1038,15 +932,15 @@ Status OlapScanNode::normalize_binary_predicate(SlotDescriptor* slot, ColumnValu
 
 void OlapScanNode::transfer_thread(RuntimeState* state) {
     // scanner open pushdown to scanThread
-    Status status = Status::OK();
-    for (auto scanner : _olap_scanners) {
-        status = Expr::clone_if_not_exists(_conjunct_ctxs, state, scanner->conjunct_ctxs());
-        if (!status.ok()) {
-            boost::lock_guard<SpinLock> guard(_status_mutex);
-            _status = status;
-            break;
-        }
-    }
+    // Status status = Status::OK();
+    // for (auto scanner : _olap_scanners) {
+    //     status = Expr::clone_if_not_exists(_conjunct_ctxs, state, scanner->conjunct_ctxs());
+    //     if (!status.ok()) {
+    //         boost::lock_guard<SpinLock> guard(_status_mutex);
+    //         _status = status;
+    //         break;
+    //     }
+    // }
 
     /*********************************
      * 优先级调度基本策略:
@@ -1058,246 +952,291 @@ void OlapScanNode::transfer_thread(RuntimeState* state) {
      *    nice值越大的，越优先获得的查询资源
      * 4. 定期提高队列内残留任务的优先级，避免大查询完全饿死
      *********************************/
-    PriorityThreadPool* thread_pool = state->exec_env()->thread_pool();
-    _total_assign_num = 0;
-    _nice = 18 + std::max(0, 2 - (int)_olap_scanners.size() / 5);
-    std::list<OlapScanner*> olap_scanners;
+    // PriorityThreadPool* thread_pool = state->exec_env()->thread_pool();
+    //_total_assign_num = 0;
+    // _nice = 18;
+    // std::list<OlapScanner*> olap_scanners;
 
-    int64_t mem_limit = 512 * 1024 * 1024;
-    // TODO(zc): use memory limit
-    int64_t mem_consume = __sync_fetch_and_add(&_buffered_bytes, 0);
-    if (state->fragment_mem_tracker() != nullptr) {
-        mem_limit = state->fragment_mem_tracker()->limit();
-        mem_consume = state->fragment_mem_tracker()->consumption();
-    }
-    int max_thread = _max_materialized_row_batches;
-    if (config::doris_scanner_row_num > state->batch_size()) {
-        max_thread /= config::doris_scanner_row_num / state->batch_size();
-    }
+    // int64_t mem_limit = 512 * 1024 * 1024;
+    // // TODO(zc): use memory limit
+    // int64_t mem_consume = __sync_fetch_and_add(&_buffered_bytes, 0);
+    // if (state->fragment_mem_tracker() != nullptr) {
+    //     mem_limit = state->fragment_mem_tracker()->limit();
+    //     mem_consume = state->fragment_mem_tracker()->consumption();
+    // }
+    // int max_thread = _max_materialized_row_batches;
+    // if (config::doris_scanner_row_num > state->batch_size()) {
+    //     max_thread /= config::doris_scanner_row_num / state->batch_size();
+    // }
     // read from scanner
-    while (LIKELY(status.ok())) {
-        int assigned_thread_num = 0;
-        // copy to local
-        {
-            boost::unique_lock<boost::mutex> l(_scan_batches_lock);
-            assigned_thread_num = _running_thread;
-            // int64_t buf_bytes = __sync_fetch_and_add(&_buffered_bytes, 0);
-            // How many thread can apply to this query
-            size_t thread_slot_num = 0;
-            mem_consume = __sync_fetch_and_add(&_buffered_bytes, 0);
-            if (state->fragment_mem_tracker() != nullptr) {
-                mem_consume = state->fragment_mem_tracker()->consumption();
-            }
-            if (mem_consume < (mem_limit * 6) / 10) {
-                thread_slot_num = max_thread - assigned_thread_num;
-            } else {
-                // Memory already exceed
-                if (_scan_row_batches.empty()) {
-                    // NOTE(zc): here need to lock row_batches_lock_
-                    //  be worried about dead lock, so don't check here
-                    // if (materialized_row_batches_.empty()) {
-                    //     LOG(FATAL) << "Scan_row_batches_ and materialized_row_batches_"
-                    //         " are empty when memory exceed";
-                    // }
-                    // Just for notify if scan_row_batches_ is empty and no running thread
-                    if (assigned_thread_num == 0) {
-                        thread_slot_num = 1;
-                        // NOTE: if olap_scanners_ is empty, scanner_done_ should be true
-                    }
-                }
-            }
-            thread_slot_num = std::min(thread_slot_num, _olap_scanners.size());
-            for (int i = 0; i < thread_slot_num; ++i) {
-                olap_scanners.push_back(_olap_scanners.front());
-                _olap_scanners.pop_front();
-                _running_thread++;
-                assigned_thread_num++;
-            }
-        }
+    // while (LIKELY(status.ok())) {
+    //     int assigned_thread_num = 0;
+    //     // copy to local
+    //     {
+    //         boost::unique_lock<boost::mutex> l(_scan_batches_lock);
+    //         assigned_thread_num = _running_thread;
+    //         // int64_t buf_bytes = __sync_fetch_and_add(&_buffered_bytes, 0);
+    //         // How many thread can apply to this query
+    //         size_t thread_slot_num = 1;
+    //         // mem_consume = __sync_fetch_and_add(&_buffered_bytes, 0);
+    //         // if (state->fragment_mem_tracker() != nullptr) {
+    //         //     mem_consume = state->fragment_mem_tracker()->consumption();
+    //         // }
+    //         // if (mem_consume < (mem_limit * 6) / 10) {
+    //         //     thread_slot_num = max_thread - assigned_thread_num;
+    //         // } else {
+    //         //     // Memory already exceed
+    //         //     if (_scan_row_batches.empty()) {
+    //         //         // NOTE(zc): here need to lock row_batches_lock_
+    //         //         //  be worried about dead lock, so don't check here
+    //         //         // if (materialized_row_batches_.empty()) {
+    //         //         //     LOG(FATAL) << "Scan_row_batches_ and materialized_row_batches_"
+    //         //         //         " are empty when memory exceed";
+    //         //         // }
+    //         //         // Just for notify if scan_row_batches_ is empty and no running thread
+    //         //         if (assigned_thread_num == 0) {
+    //         //             thread_slot_num = 1;
+    //         //             // NOTE: if olap_scanners_ is empty, scanner_done_ should be true
+    //         //         }
+    //         //     }
+    //         // }
+    //         // thread_slot_num = std::min(thread_slot_num, _olap_scanners.size());
+    //         for (int i = 0; i < thread_slot_num && _scanner_index < _olap_scanners.size(); ++i) {
+    //             olap_scanners.push_back(_olap_scanners[_scanner_index]);
+    //             _scanner_index++;
+    //             //_olap_scanners.pop_front();
+    //             _running_thread++;
+    //             assigned_thread_num++;
+    //         }
+    //     }
 
-        auto iter = olap_scanners.begin();
-        while (iter != olap_scanners.end()) {
-            PriorityThreadPool::Task task;
-            task.work_function = boost::bind(&OlapScanNode::scanner_thread, this, *iter);
-            task.priority = _nice;
-            if (thread_pool->offer(task)) {
-                olap_scanners.erase(iter++);
-            } else {
-                LOG(FATAL) << "Failed to assign scanner task to thread pool!";
-            }
-            ++_total_assign_num;
-        }
+        // auto iter = olap_scanners.begin();
+        // while (iter != olap_scanners.end()) {
+        //     // PriorityThreadPool::Task task;
+        //     // task.work_function = boost::bind(&OlapScanNode::scanner_thread, this, *iter);
+        //     // task.priority = _nice;
+        //     // if (thread_pool->offer(task)) {
+        //     //     olap_scanners.erase(iter++);
+        //     // } else {
+        //     //     LOG(FATAL) << "Failed to assign scanner task to thread pool!";
+        //     // }
+        //     //++_total_assign_num;
+        //     iter++;
+        // }
 
-        RowBatchInterface* scan_batch = NULL;
-        {
-            // 1 scanner idle task not empty, assign new sanner task
-            boost::unique_lock<boost::mutex> l(_scan_batches_lock);
+    //     RowBlockV2* scan_batch = nullptr;
+    //     {
+    //         // 1 scanner idle task not empty, assign new sanner task
+    //         boost::unique_lock<boost::mutex> l(_scan_batches_lock);
 
-            // scanner_row_num = 16k
-            // 16k * 10 * 12 * 8 = 15M(>2s)  --> nice=10
-            // 16k * 20 * 22 * 8 = 55M(>6s)  --> nice=0
-            while (_nice > 0
-                       && _total_assign_num > (22 - _nice) * (20 - _nice) * 6) {
-                --_nice;
-            }
+    //         // scanner_row_num = 16k
+    //         // 16k * 10 * 12 * 8 = 15M(>2s)  --> nice=10
+    //         // 16k * 20 * 22 * 8 = 55M(>6s)  --> nice=0
+    //         // while (_nice > 0
+    //         //            && _total_assign_num > (22 - _nice) * (20 - _nice) * 6) {
+    //         //     --_nice;
+    //         // }
 
-            // 2 wait when all scanner are running & no result in queue
-            while (UNLIKELY(_running_thread == assigned_thread_num
-                            && _scan_row_batches.empty()
-                            && !_scanner_done)) {
-                _scan_batch_added_cv.wait(l);
-            }
+    //         // 2 wait when all scanner are running & no result in queue
+    //         while (UNLIKELY(_running_thread == assigned_thread_num
+    //                         && _scan_row_batches.empty()
+    //                         && !_scanner_done)) {
+    //             _scan_batch_added_cv.wait(l);
+    //         }
 
-            // 3 transfer result row batch when queue is not empty
-            if (LIKELY(!_scan_row_batches.empty())) {
-                scan_batch = _scan_row_batches.front();
-                _scan_row_batches.pop_front();
+    //         // 3 transfer result row batch when queue is not empty
+    //         if (LIKELY(!_scan_row_batches.empty())) {
+    //             scan_batch = _scan_row_batches.front();
+    //             _scan_row_batches.pop_front();
 
-                // delete scan_batch if transfer thread should be stoped
-                // because scan_batch wouldn't be useful anymore
-                if (UNLIKELY(_transfer_done)) {
-                    delete scan_batch;
-                    scan_batch = NULL;
-                }
-            } else {
-                if (_scanner_done) {
-                    break;
-                }
-            }
-        }
+    //             // delete scan_batch if transfer thread should be stoped
+    //             // because scan_batch wouldn't be useful anymore
+    //             if (UNLIKELY(_transfer_done)) {
+    //                 delete scan_batch;
+    //                 scan_batch = NULL;
+    //             }
+    //         } else {
+    //             if (_scanner_done) {
+    //                 break;
+    //             }
+    //         }
+    //     }
 
-        if (NULL != scan_batch) {
-            add_one_batch(scan_batch);
-        }
-    }
+    //     if (NULL != scan_batch) {
+    //         add_one_batch(scan_batch);
+    //     }
+    // }
 
-    VLOG(1) << "TransferThread finish.";
-    boost::unique_lock<boost::mutex> l(_row_batches_lock);
-    _transfer_done = true;
-    _row_batch_added_cv.notify_all();
+    // VLOG(1) << "TransferThread finish.";
+    // boost::unique_lock<boost::mutex> l(_row_batches_lock);
+    // _transfer_done = true;
+    // _row_batch_added_cv.notify_all();
 }
 
-void OlapScanNode::scanner_thread(OlapScanner* scanner) {
+void OlapScanNode::scanner_thread() {
     Status status = Status::OK();
     bool eos = false;
-    RuntimeState* state = scanner->runtime_state();
-    DCHECK(NULL != state);
-    if (!scanner->is_open()) {
-        status = scanner->open();
-        if (!status.ok()) {
-            boost::lock_guard<SpinLock> guard(_status_mutex);
-            _status = status;
-            eos = true;
+    // RuntimeState* state = scanner->runtime_state();
+    // DCHECK(NULL != state);
+    _cur_scanner = _olap_scanners[_scanner_index];
+    for(; _scanner_index < _olap_scanners.size(); _scanner_index++, _cur_scanner = _olap_scanners[_scanner_index]) {
+        if (!_cur_scanner->is_open()) {
+            status = _cur_scanner->open();
+            if (!status.ok()) {
+                boost::lock_guard<SpinLock> guard(_status_mutex);
+                _status = status;
+                eos = true;
+            }
+            _cur_scanner->set_opened();
         }
-        scanner->set_opened();
+        while (!eos) {
+            if (UNLIKELY(_transfer_done)) {
+                eos = true;
+                status = Status::Cancelled("Cancelled");
+                LOG(INFO) << "Scan thread cancelled, cause query done, maybe reach limit.";
+                break;
+            }
+            RowBlockV2* block = nullptr;
+            status = _cur_scanner->get_batch(_runtime_state, &block, &eos);
+            if (LIKELY(status.ok())) {
+                if (LIKELY(block != nullptr && !eos)) {
+                    //row_batchs.push_back(block);
+                    //raw_rows_read += block->selected_size();
+                    boost::unique_lock<boost::mutex> l(_scan_batches_lock);
+                    _scan_row_batches.push_back(block);
+                    _scan_batch_added_cv.notify_one();
+                }
+            } else {
+                LOG(WARNING) << "Scan thread read OlapScanner failed: " << status.to_string();
+                eos = true;
+                boost::unique_lock<boost::mutex> l(_scan_batches_lock);
+                 _transfer_done = true;
+                break;
+            }
+        }
+        eos = false;
     }
 
-    // apply to cgroup
-    if (_resource_info != nullptr) {
-        CgroupsMgr::apply_cgroup(_resource_info->user, _resource_info->group);
-    }
+    boost::unique_lock<boost::mutex> l(_scan_batches_lock);
+    _transfer_done = true;
 
-    std::vector<RowBatch*> row_batchs;
+    // // apply to cgroup
+    // if (_resource_info != nullptr) {
+    //     CgroupsMgr::apply_cgroup(_resource_info->user, _resource_info->group);
+    // }
 
+    //std::vector<RowBlockV2*> row_batchs;
     // Because we use thread pool to scan data from storage. One scanner can't
     // use this thread too long, this can starve other query's scanner. So, we
     // need yield this thread when we do enough work. However, OlapStorage read
     // data in pre-aggregate mode, then we can't use storage returned data to
     // judge if we need to yield. So we record all raw data read in this round
     // scan, if this exceed threshold, we yield this thread.
-    int64_t raw_rows_read = scanner->raw_rows_read();
-    int64_t raw_rows_threshold = raw_rows_read + config::doris_scanner_row_num;
-    while (!eos && raw_rows_read < raw_rows_threshold) {
-        if (UNLIKELY(_transfer_done)) {
-            eos = true;
-            status = Status::Cancelled("Cancelled");
-            LOG(INFO) << "Scan thread cancelled, cause query done, maybe reach limit.";
-            break;
-        }
-        RowBatch *row_batch = new RowBatch(
-                this->row_desc(), state->batch_size(), _runtime_state->fragment_mem_tracker());
-        row_batch->set_scanner_id(scanner->id());
-        status = scanner->get_batch(_runtime_state, row_batch, &eos);
-        if (!status.ok()) {
-            LOG(WARNING) << "Scan thread read OlapScanner failed: " << status.to_string();
-            eos = true;
-            break;
-        }
-        // 4. if status not ok, change status_.
-        if (UNLIKELY(row_batch->num_rows() == 0)) {
-            // may be failed, push already, scan node delete this batch.
-            delete row_batch;
-            row_batch = NULL;
-        } else {
-            row_batchs.push_back(row_batch);
-            __sync_fetch_and_add(&_buffered_bytes,
-                                 row_batch->tuple_data_pool()->total_reserved_bytes());
-        }
-        raw_rows_read = scanner->raw_rows_read();
-    }
+    // int64_t raw_rows_read = 0;
+    //int64_t raw_rows_threshold = raw_rows_read + config::doris_scanner_row_num;
+    // while (!eos) {
+    //     if (UNLIKELY(_transfer_done)) {
+    //         eos = true;
+    //         status = Status::Cancelled("Cancelled");
+    //         LOG(INFO) << "Scan thread cancelled, cause query done, maybe reach limit.";
+    //         break;
+    //     }
+    //     // RowBatch *row_batch = new RowBatch(
+    //     //         this->row_desc(), state->batch_size(), _runtime_state->fragment_mem_tracker());
+    //     // row_batch->set_scanner_id(scanner->id());
+    //     RowBlockV2* block = nullptr;
+    //     status = scanner->get_batch(_runtime_state, &block, &eos);
+    //     // if (!status.ok()) {
+    //     //     LOG(WARNING) << "Scan thread read OlapScanner failed: " << status.to_string();
+    //     //     eos = true;
+    //     //     break;
+    //     // }
+    //     // // 4. if status not ok, change status_.
+    //     // if (UNLIKELY(row_batch->num_rows() == 0)) {
+    //     //     // may be failed, push already, scan node delete this batch.
+    //     //     delete row_batch;
+    //     //     row_batch = NULL;
+    //     // } else {
+    //     //     row_batchs.push_back(row_batch);
+    //     //     __sync_fetch_and_add(&_buffered_bytes,
+    //     //                          row_batch->tuple_data_pool()->total_reserved_bytes());
+    //     // }
 
-    {
-        boost::unique_lock<boost::mutex> l(_scan_batches_lock);
-        // if we failed, check status.
-        if (UNLIKELY(!status.ok())) {
-            _transfer_done = true;
-            boost::lock_guard<SpinLock> guard(_status_mutex);
-            if (LIKELY(_status.ok())) {
-                _status = status;
-            }
-        }
+    //     if (LIKELY(status.ok())) {
+    //         if (LIKELY(block != nullptr && !eos)) {
+    //             //row_batchs.push_back(block);
+    //             //raw_rows_read += block->selected_size();
+    //             boost::unique_lock<boost::mutex> l(_scan_batches_lock);
+    //             _scan_row_batches.push_back(block);
+    //         }
+    //     } else {
+    //         LOG(WARNING) << "Scan thread read OlapScanner failed: " << status.to_string();
+    //         eos = true;
+    //         break;
+    //     }
+    // }
+    // _running_thread--;
+    // {
+    //     boost::unique_lock<boost::mutex> l(_scan_batches_lock);
+    //     // if we failed, check status.
+    //     if (UNLIKELY(!status.ok())) {
+    //         _transfer_done = true;
+    //         boost::lock_guard<SpinLock> guard(_status_mutex);
+    //         if (LIKELY(_status.ok())) {
+    //             _status = status;
+    //         }
+    //     }
 
-        bool global_status_ok = false;
-        {
-            boost::lock_guard<SpinLock> guard(_status_mutex);
-            global_status_ok = _status.ok();
-        }
-        if (UNLIKELY(!global_status_ok)) {
-            eos = true;
-            for (auto rb : row_batchs) {
-                delete rb;
-            }
-        } else {
-            for (auto rb : row_batchs) {
-                _scan_row_batches.push_back(rb);
-            }
-        }
-        // If eos is true, we will process out of this lock block.
-        if (!eos) {
-            _olap_scanners.push_front(scanner);
-        }
-        _running_thread--;
-    }
-    if (eos) {
-        // close out of batches lock. we do this before _progress update
-        // that can assure this object can keep live before we finish.
-        scanner->close(_runtime_state);
+    //     bool global_status_ok = false;
+    //     {
+    //         boost::lock_guard<SpinLock> guard(_status_mutex);
+    //         global_status_ok = _status.ok();
+    //     }
+    //     if (UNLIKELY(!global_status_ok)) {
+    //         eos = true;
+    //         // for (auto rb : row_batchs) {
+    //         //     delete rb;
+    //         // }
+    //     } else {
+    //         for (auto rb : row_batchs) {
+    //             _scan_row_batches.push_back(rb);
+    //         }
+    //     }
+    //     // If eos is true, we will process out of this lock block.
+    //     // if (!eos) {
+    //     //     _olap_scanners.push_front(scanner);
+    //     // }
 
-        boost::unique_lock<boost::mutex> l(_scan_batches_lock);
-        _progress.update(1);
-        if (_progress.done()) {
-            // this is the right out
-            _scanner_done = true;
-        }
-    }
-    _scan_batch_added_cv.notify_one();
+    // }
+    // if (eos) {
+    //     // // close out of batches lock. we do this before _progress update
+    //     // // that can assure this object can keep live before we finish.
+    //     // scanner->close(_runtime_state);
+    // }
+    // boost::unique_lock<boost::mutex> l(_scan_batches_lock);
+    // _progress.update(1);
+    // if (_progress.done()) {
+    //     // this is the right out
+    //     _scanner_done = true;
+    // }
+    // _scan_batch_added_cv.notify_one();
 }
 
-Status OlapScanNode::add_one_batch(RowBatchInterface* row_batch) {
-    {
-        boost::unique_lock<boost::mutex> l(_row_batches_lock);
+Status OlapScanNode::add_one_batch(RowBlockV2* row_batch) {
+    // {
+    //     boost::unique_lock<boost::mutex> l(_row_batches_lock);
 
-        while (UNLIKELY(_materialized_row_batches.size()
-                        >= _max_materialized_row_batches
-                        && !_transfer_done)) {
-            _row_batch_consumed_cv.wait(l);
-        }
+    //     while (UNLIKELY(_materialized_row_batches.size()
+    //                     >= _max_materialized_row_batches
+    //                     && !_transfer_done)) {
+    //         _row_batch_consumed_cv.wait(l);
+    //     }
 
-        VLOG(2) << "Push row_batch to materialized_row_batches";
-        _materialized_row_batches.push_back(row_batch);
-    }
-    // remove one batch, notify main thread
-    _row_batch_added_cv.notify_one();
+    //     VLOG(2) << "Push row_batch " << (void*) row_batch;
+    //     _materialized_row_batches.push_back(row_batch);
+    // }
+    // // remove one batch, notify main thread
+    // _row_batch_added_cv.notify_one();
     return Status::OK();
 }
 

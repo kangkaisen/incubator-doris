@@ -512,6 +512,8 @@ namespace config {
     // this is a an enhancement for better performance to manage tablet
     CONF_Int32(tablet_map_shard_size, "1");
 
+    CONF_Int32(row_block_v2_size, "1024");
+
 } // namespace config
 
 } // namespace doris
